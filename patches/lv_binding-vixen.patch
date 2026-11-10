@@ -1,0 +1,51 @@
+diff --git a/gen/gen_mpy.py b/gen/gen_mpy.py
+index ee61a87..71f765f 100644
+--- a/gen/gen_mpy.py
++++ b/gen/gen_mpy.py
+@@ -1832,7 +1832,7 @@ static unsigned long long mp_obj_get_ull(mp_obj_t obj)
+ 
+     unsigned long long val = 0;
+     bool big_endian = !(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__);
+-    mp_obj_int_to_bytes_impl(obj, big_endian, sizeof(val), (byte*)&val);
++    mp_obj_int_to_bytes(obj, sizeof(val), (byte*)&val, big_endian, false, false);
+     return val;
+ }
+ 
+diff --git a/micropython.mk b/micropython.mk
+index 6aa6c3d..0ce81df 100644
+--- a/micropython.mk
++++ b/micropython.mk
+@@ -90,6 +90,7 @@ $(LVGL_MPY): $(ALL_LVGL_SRC) $(LVGL_BINDING_DIR)/gen/gen_mpy.py
+ 		-I $(LVGL_BINDING_DIR)/pycparser/utils/fake_libc_include \
+ 		-I $(LVGL_BINDING_DIR)/stubs/include \
+ 		$(CFLAGS_USERMOD) \
++		-include $(LVGL_DIR)/lvgl.h \
+ 		$(LVGL_DIR)/lvgl_private.h | $(LV_PP_FILTER) > $(LVGL_PP)
+ 	$(Q)$(PYTHON) $(LVGL_BINDING_DIR)/gen/gen_mpy.py -M lvgl -MP lv -MD $(LVGL_MPY_METADATA) -E $(LVGL_PP) $(LVGL_DIR)/lvgl.h > $@
+ 
+diff --git a/lvgl/src/stdlib/micropython/lv_mem_core_micropython.c b/lvgl/src/stdlib/micropython/lv_mem_core_micropython.c
+index a671b5e..14e9879 100644
+--- a/lvgl/src/stdlib/micropython/lv_mem_core_micropython.c
++++ b/lvgl/src/stdlib/micropython/lv_mem_core_micropython.c
+@@ -63,7 +63,11 @@ void lv_mem_remove_pool(lv_mem_pool_t pool)
+ void * lv_malloc_core(size_t size)
+ {
+ #if MICROPY_MALLOC_USES_ALLOCATED_SIZE
+-    return gc_alloc(size, true);
++    /* VIXEN-32 patch: the second argument is a flag set since MicroPython
++     * 1.21; `true` (= GC_ALLOC_FLAG_HAS_FINALISER) marked every LVGL block as
++     * a Python object with __del__, and the gc then read raw LVGL memory as a
++     * type pointer when sweeping (crash on soft reset). No flags. */
++    return gc_alloc(size, 0);
+ #else
+     return m_malloc(size);
+ #endif
+@@ -73,7 +77,7 @@ void * lv_realloc_core(void * p, size_t new_size)
+ {
+ 
+ #if MICROPY_MALLOC_USES_ALLOCATED_SIZE
+-    return gc_realloc(p, new_size, true);
++    return gc_realloc(p, new_size, true);   /* here `true` = allow_move, correct */
+ #else
+     return m_realloc(p, new_size);
+ #endif
