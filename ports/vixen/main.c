@@ -32,6 +32,9 @@
 #include "py/mperrno.h"
 #include "shared/runtime/gchelper.h"
 #include "shared/runtime/pyexec.h"
+#include "py/persistentcode.h"
+#include "kernel_api.h"
+#include "vih_regs.h"
 
 #if VIXEN_SOUND
 void vixen_sound_reset(void);
@@ -50,6 +53,7 @@ void vixen_sound_reset(void);
  * it here before gc_init -- unlike BRAM bss, the chip-RAM window is not wiped
  * by the boot path. */
 extern char _GC_HEAP_START[];
+static void zorro_init(void);
 
 void vixen_disk_automount(void);
 void vixen_disk_enter_app_dir(void);
@@ -59,6 +63,9 @@ void vixen_disk_enter_app_dir(void);
 #endif
 #if MICROPY_PY_NETWORK
 #include "extmod/modnetwork.h"
+#endif
+#if VIXEN_SQLITE
+#include "vixen_sqlite.h"
 #endif
 
 void vixen_random_init(void);
@@ -70,6 +77,11 @@ int main(int argc, char **argv) {
     vixen_random_init();
     memset(_GC_HEAP_START, 0, MICROPY_HEAP_SIZE);
     gc_init(_GC_HEAP_START, _GC_HEAP_START + MICROPY_HEAP_SIZE);
+    zorro_init();
+    vih_icache(1u);
+    #if VIXEN_SQLITE
+    vixen_sqlite_init();
+    #endif
 
     for (;;) {
         mp_init();
@@ -83,6 +95,7 @@ int main(int argc, char **argv) {
         #endif
         #if VIXEN_LVGL
         vx_lvgl_mp_reset();
+        vx_gfx_reset();
         #endif
         vixen_disk_automount();
 
@@ -120,6 +133,10 @@ int main(int argc, char **argv) {
 
         mp_printf(&mp_plat_print, "MPY: soft reboot\n");
 
+        #if VIXEN_SQLITE
+        /* before the sweep: SQLite's globals point into the gc heap */
+        vixen_sqlite_reset();
+        #endif
         /* Runs the finalisers: open sockets are closed here, before the
          * objects lwIP's callbacks point at are gone. */
         gc_sweep_all();
@@ -130,6 +147,83 @@ int main(int argc, char **argv) {
         mod_network_deinit();
         #endif
         mp_deinit();
+    }
+}
+
+/* ---- instruction cache (core v0.88+) -----------------------------------
+ * 8 KB, for code fetched above the BRAM: everything in .chiptext (the LVGL
+ * widgets and binding, extmod, the sound module) and native code on the
+ * heap. Measured on the MEGA65: compile() 37 % faster before the compiler
+ * moved to BRAM, json 8 %. Code in BRAM runs as before. The kernel switches
+ * it off at every .rvk launch; on older cores the write is ignored. RULE: new
+ * machine code in RAM -> vih_cache_invalidate() before it runs: the
+ * native/viper emitters and native .mpy files commit through here. */
+void *vixen_commit_exec(void *buf, size_t len, void *reloc) {
+    (void)len;
+    if (reloc != NULL) {
+        mp_native_relocate(reloc, buf, (uintptr_t)buf);
+    }
+    vih_cache_invalidate();
+    return buf;
+}
+
+/* ---- Zorro RAM: room for the gc heap to grow ---------------------------
+ * Core v0.89+ has 48 MB more SDRAM at 0x41000000, CPU only (the blitter,
+ * video and audio cannot see it). Python objects never go to the hardware --
+ * framebuffers, sound and sprites use fixed chip-RAM windows -- so the gc heap
+ * may live there. The chip-RAM arena stays the first area; when a collection
+ * cannot free enough, gc.c (MICROPY_GC_SPLIT_HEAP_AUTO) asks for a new area
+ * that doubles the heap (6 -> 12 -> 24 -> 48 MB ...), and gives an area that
+ * is empty after a collection back. A collection only walks the used part of
+ * each area, so a small program pays nothing for the 48 MB.
+ *
+ * The areas come from the kernel's allocator (ksys_alloc_mem, KMEM_ZORRO),
+ * so a kernel module that takes Zorro RAM is respected. Kernels without the
+ * call (NULL entry, before build 123) and cores without Zorro RAM: no growth,
+ * the heap stays MICROPY_HEAP_SIZE. */
+static uint32_t zorro_avail;   /* bytes the gc may still ask for */
+static struct { void *p; uint32_t size; } zorro_area[32];   /* what it holds */
+
+static void zorro_init(void) {
+    zorro_avail = 0;
+    if (KERNEL_ENTRY(KENT_SYS_ALLOC_MEM) != NULL && KERNEL_ENTRY(KENT_SYS_ALLOC_FREE) != NULL
+        && vih_zorro_present()) {
+        zorro_avail = ZORRO_RAM_SIZE;
+    }
+}
+
+size_t gc_get_max_new_split(void) {
+    return zorro_avail;
+}
+
+void *vixen_zorro_alloc(size_t size) {
+    for (size_t i = 0; i < MP_ARRAY_SIZE(zorro_area); i++) {
+        if (zorro_area[i].p == NULL) {
+            if (size > zorro_avail) {
+                return NULL;
+            }
+            void *p = ksys_alloc_mem(KMEM_ZORRO, 0, size, 16);
+            if (p == NULL) {
+                zorro_avail = 0;    /* the pool is fuller than we thought */
+                return NULL;
+            }
+            zorro_area[i].p = p;
+            zorro_area[i].size = size;
+            zorro_avail -= size;
+            return p;
+        }
+    }
+    return NULL;
+}
+
+void vixen_zorro_free(void *ptr) {
+    for (size_t i = 0; i < MP_ARRAY_SIZE(zorro_area); i++) {
+        if (zorro_area[i].p == ptr) {
+            zorro_avail += zorro_area[i].size;
+            zorro_area[i].p = NULL;
+            ksys_alloc_free(ptr);
+            return;
+        }
     }
 }
 

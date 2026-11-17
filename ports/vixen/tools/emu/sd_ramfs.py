@@ -80,9 +80,17 @@ class _RamFile(io.IOBase):
             self.path = None
 
     def ioctl(self, req, arg):
-        # stream protocol for imports from this filesystem: 4 = close
+        # stream protocol for imports from this filesystem: 4 = close; and
+        # 2 = seek from C (mp_stream_seek, e.g. sound.qoa): arg points to
+        # struct mp_stream_seek_t { mp_off_t offset; int whence; }
         if req == 4:
             self.close()
+        elif req == 2:
+            import machine
+            off = machine.mem32[arg]
+            if off >= 0x80000000:
+                off -= 0x100000000
+            machine.mem32[arg] = self.seek(off, machine.mem32[arg + 4])
         return 0
 
     def __enter__(self):

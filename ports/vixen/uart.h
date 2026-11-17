@@ -26,6 +26,7 @@
 #ifndef MICROPY_INCLUDED_QEMU_ARM_UART_H
 #define MICROPY_INCLUDED_QEMU_ARM_UART_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -37,6 +38,14 @@ int uart_rx_chr(void);
 int uart_rx_any(void);
 void uart_poll(void);
 void uart_set_tile_scroll(uint32_t x, uint32_t y);
+bool uart_console_set_margin(uint32_t l, uint32_t r, uint32_t t, uint32_t b);
+void uart_console_margins(uint32_t m[4]);
+uint32_t uart_console_width(void);
+void uart_console_set_hires(bool on);
+bool uart_console_hires(void);
+uint32_t uart_console_cols(void);
+uint32_t uart_console_rows(void);
+uint32_t uart_console_height(void);
 void uart_tx_strn(const char *buf, size_t len);
 
 // vixen_eth.c: drain the Ethernet receiver and run lwIP's timers.

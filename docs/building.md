@@ -27,6 +27,7 @@ This puts everything into `deps/` (ignored by git):
 | `deps/micropython` | MicroPython v1.29.0 with the lwip, mbedtls and micropython-lib submodules |
 | `deps/lv_binding_micropython` | LVGL binding (pinned commit, LVGL 9.3.0), patched with `patches/lv_binding-vixen.patch` |
 | `deps/usermods/lvgl` | link to the binding, used as `USER_C_MODULES` |
+| `deps/micropython-sqlite3` | the `sqlite3` module (pinned commit, SQLite 3.54.1 amalgamation), a user C module |
 | `deps/vixen32-devkit` | link to your devkit |
 
 `mpy-cross` is built once by `setup.sh` (it freezes `mip`, `net` and `sshd`
@@ -43,17 +44,22 @@ If the toolchain is not in `~/.espressif/tools/...`, point to its `bin/`:
 
 | Build | Command | Contents |
 | --- | --- | --- |
-| network | `./build.sh BUILD=build-net` | REPL, SD card, network, TLS, `mip`, `requests`, `sshd`, `sound`, `curve25519` |
-| LVGL + network | `./build.sh LVGL=1 BUILD=build-lvgl-net` | everything above plus `lvgl`, 4 MB gc heap, C stack in BRAM |
-| LVGL only | `./build.sh LVGL=1 NET=0 BUILD=build-lvgl` | LVGL and sound, no network |
+| network | `./build.sh BUILD=build-net` | REPL, SD card, network, TLS, `mip`, `requests`, `sshd`, `sound`, `curve25519`, `sqlite3` |
+| LVGL + network | `./build.sh LVGL=1 BUILD=build-lvgl-net` | everything above plus `lvgl`, C stack in BRAM |
+| LVGL only | `./build.sh LVGL=1 NET=0 BUILD=build-lvgl` | LVGL, sound and `sqlite3`, no network |
 | plain | `./build.sh NET=0 BUILD=build-plain` | the interpreter alone, BRAM only, single-block `.rvk` |
+
+`SQLITE=0` leaves `sqlite3` out of any of them ([SQLite](sqlite.md)).
 
 The result is `ports/vixen/<BUILD>/firmware.rvk`, next to `firmware.elf`
 (for the emulator), `firmware.bin` and the link map.
 
 The LVGL + network build is the most complete one and the recommended
-default; the network build leaves more room in chip RAM and keeps the
-C stack in chip RAM (only ~2 KB of BRAM are left in it).
+default; the network build keeps the C stack in chip RAM (only ~2 KB of
+BRAM are left in it). Every build has a 6 MB Python heap (chip RAM
+0x900000-0xF00000, `MICROPY_HEAP_SIZE` in `boards/VIXEN32/mpconfigboard.mk`)
+that grows by up to 48 MB into Zorro RAM on core v0.89+
+([architecture](architecture.md#the-gc-heap-grows-into-zorro-ram)).
 
 ### Why the special link step
 
@@ -81,10 +87,17 @@ MP_QSTR_...".
    `/vixen-32/apps/micropython/lib/`. Both folders are on `sys.path`.
 3. Optional autostart: `/vixen-32/apps/micropython/boot/boot.py` and
    `boot/main.py` run at start-up and after every soft reset (Ctrl-D).
-4. On the VIXEN-32 open **F12/Help -> Load RVK** and pick `firmware.rvk`.
+4. On the VIXEN-32 press **HELP**, pick `firmware.rvk` and type `RUN`.
 
-The SD card unit (drive C:) must be enabled in the installed `BOOT.BIN`,
-otherwise `/sd` does not appear (disk images in A: and B: work regardless).
+The console starts with 92x27 characters (hi-res text; **CAPS LOCK** switches
+to 46x27 and back, like the C128's 40/80 key) and leaves a small margin, because
+HDMI TVs cut off the edges of the core's 720x576 picture. On a 1084S, or a TV
+set to show the whole picture, put `import vixen; vixen.console_margin(0, 0, 0, 0)`
+into `boot/boot.py` for all 96x28 or 48x28 (see [architecture.md](architecture.md#console-vih-text-layer--mega65-keyboard)).
+
+The SD card unit (drive C:) must be enabled in the installed `KERNEL.BIN`
+(it is in the core v0.98 release), otherwise `/sd` does not appear (disk
+images in A: and B: work regardless).
 See [architecture.md](architecture.md#sd-card-and-disk-images).
 
 Network setup: [network.md](network.md). SSH: [ssh.md](ssh.md).

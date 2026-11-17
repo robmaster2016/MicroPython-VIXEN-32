@@ -28,7 +28,7 @@
  * and the LVGL main loop.
  *
  *     import lvgl as lv, vixen    # the import runs lv_init()
- *     vixen.lv_display()          # 384x224 display + mouse; console hidden
+ *     vixen.lv_display()          # 368x216 display + mouse; console hidden
  *     btn = lv.button(lv.screen_active())
  *
  * There is no main loop to write: lv_timer_handler() runs every
@@ -57,7 +57,19 @@ void uart_console_show(bool on);
 
 #define LV_HANDLER_PERIOD_MS 5u
 
+/* A failed LVGL check (a NULL where an object must be, an allocation that
+ * failed) ends the Python call that led to it, like any other error. The
+ * usual cause: an object created before vixen.lv_display(). */
+void vx_lvgl_assert_failed(void) {
+    mp_raise_msg(&mp_type_RuntimeError,
+        MP_ERROR_TEXT("LVGL check failed (no display? call vixen.lv_display() first; out of memory?)"));
+}
+
 static bool lv_active;          /* vixen.lv_display() has run this session */
+
+bool vx_lvgl_mp_active(void) {
+    return lv_active;
+}
 static bool lv_scheduled;       /* a handler call is queued */
 static uint32_t lv_last_ms;
 

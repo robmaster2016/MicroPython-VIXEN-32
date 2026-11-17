@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Robert S. (aka Robmaster)
-# sysinfo.py -- what is this machine doing? Version, memory, drives, network.
+# sysinfo.py -- what is this machine doing? Versions, temperature, memory,
+# drives, network.
 #
 #   import sysinfo           # prints the report
 #   sysinfo.report()         # again, later
@@ -21,6 +22,11 @@ def report():
     print("MicroPython %d.%d.%d on %s" % (sys.implementation.version[:3]
                                           + (sys.implementation._machine,)))
     print("CPU      VexRiscv rv32im, 100 MHz")
+    import vixen
+    core, kern, temp = vixen.core_version(), vixen.kernel_version(), vixen.temperature()
+    print("Core     VIXEN-32 %s, kernel %s%s" % (
+        "v" + core if core else "v0.97 or older", "build %d" % kern if kern else "?",
+        ", FPGA %.1f C" % temp if temp is not None else ""))
     print("Python   heap %s, %s free (%d %%)" % (_kb(free + used), _kb(free),
                                                  100 * free // (free + used)))
     up = time.ticks_ms() // 1000
@@ -31,7 +37,10 @@ def report():
         except OSError:
             continue
         total, avail = st[0] * st[2], st[0] * st[3]
-        print("Drive    %-4s %s, %s free" % (path, _kb(total), _kb(avail)))
+        if total:
+            print("Drive    %-4s %s, %s free" % (path, _kb(total), _kb(avail)))
+        else:   # the kernel does not know the SD card's size
+            print("Drive    %-4s %s free" % (path, _kb(avail)))
     try:
         import network
         lan = network.LAN()

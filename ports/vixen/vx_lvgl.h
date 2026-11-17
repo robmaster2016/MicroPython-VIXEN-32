@@ -29,4 +29,15 @@ void vx_lvgl_mp_reset(void);
 bool vx_lvgl_mp_key_wanted(void);
 void vx_lvgl_mp_key(uint32_t key);
 
+// For the gfx module (vx_gfx.c): LVGL's palette (loaded once), a colour's
+// index in it, whether vixen.lv_display() has run this session.
+void vx_lvgl_palette_load(void);
+uint32_t vx_lvgl_rgb_index(uint32_t r, uint32_t g, uint32_t b);
+void vx_lvgl_palette_bank(uint32_t bank);
+bool vx_lvgl_mp_active(void);
+void vx_gfx_reset(void);
+
+// LVGL's LV_ASSERT_HANDLER (lv_conf.h): raises RuntimeError, never returns.
+void vx_lvgl_assert_failed(void);
+
 #endif // MICROPY_INCLUDED_VIXEN_VX_LVGL_H

@@ -3,9 +3,9 @@
  *
  * Code (text/rodata/data, incl. gp-relative small data) lives in the on-chip
  * BRAM app region 0x100..0x6A000 -- exactly like every other VIXEN-32 .rvk app
- * (tut13, DOOM). VIXEN-32's resident .rvk loader (F12/Help -> Load RVK) places
+ * (tut13, DOOM). VIXEN-32's resident .rvk loader (HELP file browser -> .RVK -> RUN) places
  * the image there and enters it at _start == 0x100. VIXEN-32 itself is left
- * untouched (no BOOT.BIN, no trampoline).
+ * untouched (no KERNEL.BIN change, no trampoline).
  *
  * The interpreter's working memory -- bss, libc heap, C stack and the
  * MicroPython gc arena -- lives in the 16 MB cached chip-RAM window at

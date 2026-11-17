@@ -47,7 +47,8 @@ image = lv.image(scr)                                                     # PNG:
 image.set_src(png_dsc)                                                    # PNG: show it
 # absolute position (top-left alignment): the drag handler adds to get_x/get_y,
 # which with center() would be offsets from the middle and run away
-image.set_pos((384 - width) // 2, (224 - height) // 2)
+SW, SH = vixen.screen_size()
+image.set_pos((SW - width) // 2, (SH - height) // 2)
 
 caption = lv.label(scr)
 caption.set_text(source + "\n%d x %d px, drag it with the mouse" % (width, height))

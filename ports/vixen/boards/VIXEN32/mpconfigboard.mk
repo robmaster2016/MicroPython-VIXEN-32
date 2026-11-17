@@ -25,8 +25,9 @@ MPY_CROSS_FLAGS =
 # Memory budget. The gc arena and C stack live in the 16 MB chip-RAM window
 # (see vixen.ld .gcram / .Stack / main.c), so they can be large; only the
 # interpreter image (code+rodata+data+bss+libc heap) sits below them in the
-# same window. 1 MB gc arena + 8 KB C stack is comfortable headroom.
-MICROPY_HEAP_SIZE ?= 1048576     # 1 MB MicroPython gc arena (in chip-RAM)
+# same window. 6 MB gc arena (up to the kernel modules at 0xF10000) + 8 KB C
+# stack.
+MICROPY_HEAP_SIZE ?= 6291456     # 6 MB MicroPython gc arena (chip RAM 0x900000-0xF00000)
 MICROPY_STACK_SIZE ?= 8192       # C call stack (in chip-RAM, grows down)
 
 # NOTE: VFS is NOT toggled here. MICROPY_VFS / MICROPY_READER_VFS are C

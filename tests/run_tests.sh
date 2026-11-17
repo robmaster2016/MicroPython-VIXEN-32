@@ -10,6 +10,10 @@
 #
 # A test passes when the script prints "TEST OK" and raises nothing.
 # test_*.sh files are host-side tests (they start the emulator themselves).
+# A line "# vx: sd" gives a test an empty RAM /sd, "# vx: examples" one
+# with ports/vixen/examples;
+# "# vx: screen" runs it with the display model (the blitter draws),
+# "# vx: rvc" stops at any compressed instruction (VX_RVC).
 # Needs: a firmware build (./build.sh BUILD=build-net), python3, and
 # qemu-system-x86_64 (user networking for the emulated Ethernet).
 set -uo pipefail
@@ -53,6 +57,16 @@ for t in $TESTS; do
           echo "sys.path.append(A + '/examples')"
           cat "$t"; } > "$OUT/${t%.*}.run.py"
         "$EMU/venv/bin/python" "$EMU/vxemu.py" "$FW" "$OUT/${t%.*}.run.py" 300 > "$log" 2>&1
+    elif grep -q "^# vx: sd" "$t"; then
+        # an empty RAM /sd with the card's semantics
+        { cat "$EMU/sd_ramfs.py"; cat "$t"; } > "$OUT/${t%.*}.run.py"
+        "$EMU/venv/bin/python" "$EMU/vxemu.py" "$FW" "$OUT/${t%.*}.run.py" 300 > "$log" 2>&1
+    elif grep -q "^# vx: rvc" "$t"; then
+        # stop at the first compressed instruction: the core has no C extension
+        VX_RVC=1 "$EMU/venv/bin/python" "$EMU/vxemu.py" "$FW" "$t" 300 > "$log" 2>&1
+    elif grep -q "^# vx: screen" "$t"; then
+        # the display model: the blitter's FILL/COPY/LINE write the frame
+        VX_SCREEN=1 "$EMU/venv/bin/python" "$EMU/vxemu.py" "$FW" "$t" 300 > "$log" 2>&1
     else
         "$EMU/venv/bin/python" "$EMU/vxemu.py" "$FW" "$t" 300 > "$log" 2>&1
     fi

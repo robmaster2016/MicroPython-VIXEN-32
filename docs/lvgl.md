@@ -14,18 +14,29 @@ Build the LVGL firmware from the repository root (see [Building](building.md)):
 ```
 
 The result is `ports/vixen/<BUILD>/firmware.rvk`. Copy it to the SD card and
-load it from the VIXEN-32 **F12/Help -> Load RVK** menu. The build without
+start it from the VIXEN-32 **HELP** file browser (pick it, type `RUN`). The build without
 LVGL (`./build.sh`) is smaller and does not contain the `lvgl` module.
 
 ## Quick start
 
 ```python
 import lvgl as lv, vixen        # importing lvgl initialises LVGL (no lv.init())
-vixen.lv_display()              # 384x224 screen + mouse; hides the console
+vixen.lv_display()              # 368x216 screen + mouse; hides the console
 b = lv.button(lv.screen_active())
 lv.label(b).set_text("Hello VIXEN")
 b.center()
 ```
+
+The screen is 368x216: the console's margins (see
+[architecture.md](architecture.md#console-vih-text-layer--mega65-keyboard)) apply to LVGL too, so nothing is
+cut off on an HDMI TV. `vixen.console_margin(0, 0, 0, 0)` *before*
+`vixen.lv_display()` gives the full 384x224; `vixen.screen_size()` returns the size, for layouts
+that should fit either.
+
+Create objects only after `vixen.lv_display()`: before it, `lv.obj()` has no
+screen to go on. LVGL's internal checks (an object it could not create, memory
+it could not get) raise `RuntimeError: LVGL check failed ...` in this port;
+stock LVGL stops the machine there.
 
 No main loop is needed: LVGL keeps running in the background, also while the
 REPL waits for input or `time.sleep()` runs.

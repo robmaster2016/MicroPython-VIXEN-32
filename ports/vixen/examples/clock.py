@@ -122,7 +122,7 @@ def _build(lv):
 
     def label(y, font, color):
         lb = lv.label(scr)
-        lb.set_width(384)
+        lb.set_width(vixen.screen_size()[0])
         lb.set_y(y)
         lb.set_style_text_align(lv.TEXT_ALIGN.CENTER, 0)
         lb.set_style_text_font(font, 0)

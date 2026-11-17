@@ -51,10 +51,14 @@
 #define MICROPY_MAKE_POINTER_CALLABLE(p) ((void *)((mp_uint_t)(p) | 1))
 #elif defined(__riscv)
 #if (__riscv_xlen == 32)
-// VIXEN-32 is rv32im_zicsr. Native codegen emits plain rv32im (no C/Zba), which
-// the core fetches directly from the chip-RAM window.
+// VIXEN-32 is rv32im_zicsr, WITHOUT the C extension. MicroPython's RV32
+// emitter uses compressed instructions wherever they fit (c.li, c.jalr,
+// c.swsp ... even in the simplest viper function, found with vxemu
+// VX_RVC=1); patches/micropython-rv32-norvc.patch adds
+// MICROPY_EMIT_RV32_RVC = 0: their 32-bit equivalents instead.
 #define MICROPY_EMIT_RV32           (1)
 #define MICROPY_EMIT_INLINE_RV32    (1)
+#define MICROPY_EMIT_RV32_RVC       (0)
 #elif (__riscv_xlen == 64)
 #define MICROPY_PERSISTENT_CODE_LOAD_NATIVE (1)
 #else
@@ -78,7 +82,7 @@
 // File import / VFS. The chip-RAM budget lets the full VFS framework in: the
 // file reader (mp_lexer_new_from_file) drives frozen modules and imports from
 // a mounted filesystem. The VIXEN-32 ROM filesystem is wired via vfs_rom_ioctl.c
-// (MICROPY_VFS_ROM / MICROPY_VFS_ROM_IOCTL); the SD card and the F12 disk images
+// (MICROPY_VFS_ROM / MICROPY_VFS_ROM_IOCTL); the SD card and the A:/B: disk images
 // are mounted at /sd, /a, /b through the kernel's disk services (vixen_disk.c).
 #define MICROPY_VFS                 (1)
 #define MICROPY_READER_VFS          (1)
@@ -111,6 +115,26 @@ extern volatile uint32_t vixen_lwip_lock;
 #define MICROPY_PY_OS_DUPTERM       (1)
 #define MICROPY_PY_CRYPTOLIB_CTR    (1)
 #define MICROPY_PY_CRYPTOLIB_CONSTS (1)
+
+#include <stddef.h>
+
+// The instruction cache (core v0.88+) is on (main.c): machine code that the
+// native/viper emitters write or a native .mpy brings must be followed by a
+// cache invalidate. The code stays on the gc heap, tracked as before.
+#define MP_PLAT_COMMIT_EXEC(buf, len, reloc) vixen_commit_exec(buf, len, reloc)
+#define MICROPY_PERSISTENT_CODE_TRACK_FUN_DATA (1)
+#define MICROPY_PERSISTENT_CODE_TRACK_BSS_RODATA (0)
+void *vixen_commit_exec(void *buf, size_t len, void *reloc);
+
+// The gc heap starts in chip RAM (MICROPY_HEAP_SIZE) and, on cores with Zorro
+// RAM (v0.89+, 48 MB), grows into it when a collection could not free enough:
+// each new area doubles the heap, empty ones go back to the kernel (main.c).
+#define MICROPY_GC_SPLIT_HEAP       (1)
+#define MICROPY_GC_SPLIT_HEAP_AUTO  (1)
+#define MP_PLAT_ALLOC_HEAP(size)    vixen_zorro_alloc(size)
+#define MP_PLAT_FREE_HEAP(ptr)      vixen_zorro_free(ptr)
+void *vixen_zorro_alloc(size_t size);
+void vixen_zorro_free(void *ptr);
 
 #if MICROPY_SSL_MBEDTLS
 // mbedtls allocates from the gc heap through these (MBEDTLS_PLATFORM_STD_CALLOC).

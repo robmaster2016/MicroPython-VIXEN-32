@@ -15,8 +15,8 @@ The network is part of the default build (see [Building](building.md)):
 ```
 
 `NET=0` builds the firmware without network. Copy
-`ports/vixen/<BUILD>/firmware.rvk` to the SD card and start it from the F12/Help
-menu.
+`ports/vixen/<BUILD>/firmware.rvk` to the SD card and start it from the HELP
+file browser.
 
 ## Getting connected
 

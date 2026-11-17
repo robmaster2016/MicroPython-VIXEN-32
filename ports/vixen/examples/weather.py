@@ -8,7 +8,7 @@
 #   weather.show(48.14, 11.58, "Munich") # anywhere else
 #
 # Data: Open-Meteo (https://open-meteo.com), free, no API key. In the LVGL
-# build the weather is drawn as a 384x224 screen (needs bigdigits.py next to
+# build the weather is drawn as a full LVGL screen (needs bigdigits.py next to
 # it); without LVGL it is printed on the console. Network via net.up().
 
 import time
@@ -90,7 +90,7 @@ class _Screen:
 
         bar = lv.obj(scr)
         bar.remove_style_all()
-        bar.set_size(384, 22)
+        bar.set_size(vixen.screen_size()[0], 22)
         bar.set_style_bg_opa(lv.OPA.COVER, 0)
         bar.set_style_bg_color(lv.color_hex(0x16324F), 0)
         self.title = self._label(bar, 8, 4, lv.font_montserrat_14, 0xFFFFFF)
@@ -106,7 +106,7 @@ class _Screen:
         self.wind = self._label(scr, 200, 88, lv.font_montserrat_12, 0xB8C7D9)
 
         self.days = []
-        w = 87
+        w = (vixen.screen_size()[0] - 16 - 3 * 6) // 4   # 4 panels, 8 px edges
         for i in range(4):
             p = lv.obj(scr)
             p.set_size(w, 104)

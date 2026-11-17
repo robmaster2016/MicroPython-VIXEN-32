@@ -19,7 +19,8 @@ VX_STAY=1          after the script, switch to the friendly REPL and keep
                    running until the timeout (for background servers on dupterm)
 VX_SCREEN=1        model the display (screen.py): the console draws into the tile
                    map, LVGL into the framebuffer, the blitter runs FILL/COPY/LINE.
-                   Needs VX_FONT=<core source>/rtl/font_rom.hex (the ROM font).
+                   Text needs VX_FONT=<core source>/rtl/font_rom.hex (the ROM
+                   font); without it text renders blank.
 VX_SHOT="a.png,b.png"  with VX_SCREEN: each write to 0x3A1FFFF0
                    (machine.mem32[0x3A1FFFF0] = 0) saves the next screenshot
 VX_SHOT_END=file   with VX_SCREEN: save a screenshot when the script is done
@@ -28,10 +29,17 @@ VX_TYPE=1          type the script into the normal REPL line by line (as a
 VX_SETUP=file      with VX_TYPE: run this script through the raw REPL first
                    (e.g. sd_ramfs.py + files to put on the RAM /sd), then
                    switch to the normal REPL and type the script
+VX_ZORRO=1         model Zorro RAM (core v0.89+): 48 MB at 0x41000000 and the
+                   kernel's ksys_alloc_mem/ksys_alloc_free for KMEM_ZORRO, so
+                   the gc heap can grow into it
+VX_RVC=1           stop at the first compressed (16-bit) instruction: the VIXEN
+                   core has no C extension, Unicorn has (slow: hooks every
+                   instruction)
 VX_SOUNDLOG=file   log the SID (0x160) and PCM (0x164/0x168) register writes
                    as "time_s reg value" lines, and dump the sound module's
                    chip-RAM window (0x380000..0x7F0000) to file.bin at exit.
 """
+import math
 import os
 import shutil
 import socket
@@ -43,7 +51,7 @@ from collections import deque
 
 from unicorn import (Uc, UcError, UC_ARCH_RISCV, UC_MODE_RISCV32, UC_HOOK_CODE, UC_HOOK_MEM_INVALID,
                      UC_HOOK_BLOCK, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE)
-from unicorn.riscv_const import UC_RISCV_REG_PC, UC_RISCV_REG_RA, UC_RISCV_REG_A0, UC_RISCV_REG_A1, UC_RISCV_REG_SP
+from unicorn.riscv_const import UC_RISCV_REG_PC, UC_RISCV_REG_RA, UC_RISCV_REG_A0, UC_RISCV_REG_A1, UC_RISCV_REG_A2, UC_RISCV_REG_A3, UC_RISCV_REG_SP
 
 ELF, SCRIPT = sys.argv[1], sys.argv[2]
 TIMEOUT = float(sys.argv[3]) if len(sys.argv) > 3 else 120.0
@@ -173,7 +181,7 @@ slog = open(SOUNDLOG, "w") if SOUNDLOG else None
 SCREEN = None
 if os.environ.get("VX_SCREEN"):
     from screen import Screen, SHOT
-    SCREEN = Screen(uc, other, os.environ["VX_FONT"])
+    SCREEN = Screen(uc, other, os.environ.get("VX_FONT"))
     SHOTS = [f for f in os.environ.get("VX_SHOT", "").split(",") if f]
 
 
@@ -181,7 +189,55 @@ def take_shot(path):
     print(f"\n[emu] screenshot {SCREEN.render(path)}")
 
 
+# ---- float co-processor (core v0.57, rtl/vih_fpu.sv) ----------------------
+# binary32, round to nearest even, denormals flushed to zero in and out, NaN
+# out = 0x7FC00000; F2I/F2U truncate and clamp; compares 1/0, false on NaN.
+def _f32(bits):
+    if (bits >> 23) & 0xFF == 0:
+        return -0.0 if bits >> 31 else 0.0
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _bits(v):
+    if v != v:
+        return 0x7FC00000
+    try:
+        b = struct.unpack("<I", struct.pack("<f", v))[0]
+    except OverflowError:
+        b = 0xFF800000 if v < 0 else 0x7F800000
+    if (b >> 23) & 0xFF == 0:
+        b &= 0x80000000
+    return b
+
+
+def fpu_op(op, a, b):
+    if op in (4, 7):                     # F2I / F2U: truncate, clamp
+        x, neg = _f32(a), bool(a >> 31)
+        if x != x or abs(x) == float("inf"):
+            return 0x80000000 if neg and op == 4 else 0 if neg else (0x7FFFFFFF if op == 4 else 0xFFFFFFFF)
+        i = int(x)
+        lo, hi = (-0x80000000, 0x7FFFFFFF) if op == 4 else (0, 0xFFFFFFFF)
+        return max(lo, min(hi, i)) & 0xFFFFFFFF
+    if op == 5:
+        return _bits(float(a - (1 << 32) if a >> 31 else a))
+    if op == 6:
+        return _bits(float(a))
+    x, y = _f32(a), _f32(b)
+    if op >= 8:
+        return int(x == y if op == 8 else x < y if op == 9 else x <= y)
+    try:
+        r = (x + y, x - y, x * y, x / y if y else None)[op]
+    except (OverflowError, IndexError):
+        r = float("nan")
+    if r is None:                        # x / 0
+        r = float("nan") if x == 0 or x != x else math.copysign(float("inf"), x) * math.copysign(1, y)
+    return _bits(r)
+
+
 def mmio_write(uc, off, size, value, user):
+    if 0x210 <= off < 0x23C:             # FPU GO(op): B = value, result at 0x208
+        other[0x208] = fpu_op((off - 0x210) >> 2, other.get(0x200, 0), value)
+        return
     if SCREEN:
         if off == SHOT:
             if SHOTS:
@@ -315,6 +371,53 @@ for name, cb in (("uart_tx_strn", on_tx), ("uart_rx_any", on_rx_any), ("uart_rx_
     uc.hook_add(UC_HOOK_CODE, cb, begin=a, end=a)
 
 
+# ---- Zorro RAM + the kernel allocator for it (VX_ZORRO) -------------------
+# The kernel table is NULL in the emulator; with VX_ZORRO two entries point at
+# a stub page whose addresses are hooked: first fit over the 48 MB.
+if os.environ.get("VX_ZORRO"):
+    ZB, ZS, STUB = 0x41000000, 0x03000000, 0x4F000000
+    uc.mem_map(ZB, ZS)
+    uc.mem_map(STUB, 0x1000)
+    uc.mem_write(STUB, struct.pack("<II", 0x00008067, 0x00008067))   # ret, ret
+    zblocks = {}                 # address -> size
+
+    def z_alloc(uc, addr, size, user):
+        a0, a1, a2, a3 = (uc.reg_read(r) for r in (UC_RISCV_REG_A0, UC_RISCV_REG_A1, UC_RISCV_REG_A2, UC_RISCV_REG_A3))
+        if a0 != 4 or a1:
+            return ret(uc, 0)
+        al, at = max(a3, 4), ZB
+        for b, n in sorted(zblocks.items()):
+            at = -(-at // al) * al
+            if at + a2 <= b:
+                break
+            at = b + n
+        at = -(-at // al) * al
+        if at + a2 > ZB + ZS:
+            return ret(uc, 0)
+        zblocks[at] = a2
+        print(f"\n[emu] zorro alloc {a2} at {at:#x}")
+        ret(uc, at)
+
+    def z_free(uc, addr, size, user):
+        a0 = uc.reg_read(UC_RISCV_REG_A0)
+        print(f"\n[emu] zorro free {zblocks.get(a0, 0)} at {a0:#x}")
+        ret(uc, 1 if zblocks.pop(a0, None) is not None else 0)
+
+    for n, cb, at in ((54, z_alloc, STUB), (55, z_free, STUB + 4)):
+        uc.mem_write(0x80000 - 4 * n, struct.pack("<I", at))
+        uc.hook_add(UC_HOOK_CODE, cb, begin=at, end=at)
+
+
+# ---- no C extension on the real core (VX_RVC) -----------------------------
+if os.environ.get("VX_RVC"):
+    def on_any(uc, addr, size, user):
+        if size == 2:
+            print(f"\n[emu] compressed instruction {uc.mem_read(addr, 2).hex()} at {addr:#x}: "
+                  f"illegal on the VIXEN core")
+            uc.emu_stop()
+    uc.hook_add(UC_HOOK_CODE, on_any)
+
+
 def on_bad(uc, access, addr, size, value, user):
     print(f"\n[emu] invalid memory access {access} at {addr:#x} pc={uc.reg_read(UC_RISCV_REG_PC):#x}")
     return False
@@ -392,5 +495,12 @@ if slog:
     slog.close()
     with open(SOUNDLOG + ".bin", "wb") as fb:
         fb.write(bytes(uc.mem_read(0x40380000, 0x470000)))
+def _where(a):
+    best = max(((v, k) for k, v in syms.items() if v <= a and a - v < sizes.get(k, 1 << 20)), default=(0, "?"))
+    return f"{a:#x} {best[1]}+{a - best[0]:#x}"
+
+
+if not state["done"] or STAY:
+    print(f"[emu] stopped in {_where(uc.reg_read(UC_RISCV_REG_PC))}, ra {_where(uc.reg_read(UC_RISCV_REG_RA))}")
 if not state["done"]:
     sys.stdout.write(out[-2000:].decode("latin-1"))

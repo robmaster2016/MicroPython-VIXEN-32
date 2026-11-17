@@ -3,10 +3,12 @@
 # Copyright (c) 2025-2026 Robert S. (aka Robmaster)
 # Fetch everything the VIXEN-32 port builds against into deps/:
 #
-#   deps/micropython              MicroPython v1.29.0 (+ lwip, mbedtls, micropython-lib)
+#   deps/micropython              MicroPython v1.29.0 (+ lwip, mbedtls, micropython-lib),
+#                                 patched: RV32 native code without the C extension
 #   deps/lv_binding_micropython   LVGL binding (+ LVGL 9.3), patched for the VIXEN
 #   deps/usermods/lvgl            -> ../lv_binding_micropython (USER_C_MODULES)
 #   deps/micropython/mpy-cross    built once (needed to freeze .py modules)
+#   deps/micropython-sqlite3      sqlite3 user C module (SQLite amalgamation inside)
 #   deps/vixen32-devkit           symlink to your VIXEN-32 devkit (optional:
 #                                 VIXEN_DEVKIT=/path/to/vixen32-devkit ./setup.sh)
 #
@@ -15,6 +17,9 @@ set -euo pipefail
 
 MPY_TAG=v1.29.0
 LVB_COMMIT=032dda4b7e8419702a4b9c4c8748a4d85d51be61   # lv_binding_micropython master, LVGL 9.3.0
+# sqlite3 module (DB-API core on the SQLite 3.54.1 amalgamation), user C module
+SQLITE3_REPO=${SQLITE3_REPO:-https://github.com/robmaster2016/micropython-sqlite3.git}
+SQLITE3_COMMIT=8fb69eb1b9a56f5068167bdfd2fab75ce8bab5d9
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 DEPS=$ROOT/deps
@@ -24,6 +29,12 @@ if [ ! -d "$DEPS/micropython/.git" ]; then
     echo "== MicroPython $MPY_TAG"
     git clone --depth 1 --branch "$MPY_TAG" https://github.com/micropython/micropython.git "$DEPS/micropython"
     git -C "$DEPS/micropython" submodule update --init --depth 1 lib/lwip lib/mbedtls lib/micropython-lib
+fi
+# the RV32 native emitter without compressed opcodes (the core has no C
+# extension): MICROPY_EMIT_RV32_RVC; --forward skips it when already applied
+if ! grep -q MICROPY_EMIT_RV32_RVC "$DEPS/micropython/py/asmrv32.h"; then
+    echo "== applying patches/micropython-rv32-norvc.patch"
+    (cd "$DEPS/micropython" && patch -p1 --forward < "$ROOT/patches/micropython-rv32-norvc.patch")
 fi
 
 if [ ! -d "$DEPS/lv_binding_micropython/.git" ]; then
@@ -35,6 +46,12 @@ if [ ! -d "$DEPS/lv_binding_micropython/.git" ]; then
     (cd "$DEPS/lv_binding_micropython" && patch -p1 --forward < "$ROOT/patches/lv_binding-vixen.patch")
 fi
 ln -sfn ../lv_binding_micropython "$DEPS/usermods/lvgl"
+
+if [ ! -d "$DEPS/micropython-sqlite3/.git" ]; then
+    echo "== micropython-sqlite3 ${SQLITE3_COMMIT:0:7}"
+    git clone "$SQLITE3_REPO" "$DEPS/micropython-sqlite3"
+    git -C "$DEPS/micropython-sqlite3" checkout -q "$SQLITE3_COMMIT"
+fi
 
 if [ ! -x "$DEPS/micropython/mpy-cross/build/mpy-cross" ]; then
     echo "== mpy-cross"

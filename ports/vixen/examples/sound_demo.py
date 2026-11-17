@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025-2026 Robert S. (aka Robmaster)
-# sound_demo.py -- music you can see. WAV and SID playback, drawn as art.
+# sound_demo.py -- music you can see. WAV, QOA and SID playback, drawn as art.
 #
-#   import sound_demo                    # starts the show: the SID, then the jazz WAV
+#   import sound_demo                    # starts the show: the SID, then the jazz QOA
 #   sound_demo.art()                     # once more (a second import does nothing)
-#   sound_demo.art("neon_grid.sid")      # one file (WAV or SID), from examples/ or a path
+#   sound_demo.art("neon_grid.sid")      # one file (WAV, QOA or SID), from examples/ or a path
 #   sound_demo.play_all("/sd/music")     # plain playback of a folder, console only
 #
-# A WAV becomes a "rosette": the real samples, read live from the sound
+# While art() plays: SPACE pauses and resumes, n skips to the next file, p
+# goes back to the previous one (r too) -- keyboard or SSH console.
+#
+# A WAV or QOA becomes a "rosette": the real samples, read live from the sound
 # module's buffer, bend rings that ripple outward. A SID tune becomes a
 # "harmonograph": every voice draws a Lissajous figure whose shape follows
 # the note it plays, growing with the gate and fading with the release. The
@@ -18,7 +21,7 @@
 # flips itself. LVGL only draws the background and the titles once. The
 # pictures need the LVGL build (its palette and framebuffers); without it
 # art() just plays. RUN/STOP
-# (Ctrl-C) ends; the music stops with it. Music in examples/: "aurec-jazz.wav"
+# (Ctrl-C) ends; the music stops with it. Music in examples/: "aurec-jazz.qoa"
 # and "neon_grid.sid" ("Neon Grid", written for this project, MIT;
 # its source is tools/sidtune/compose.py).
 
@@ -33,7 +36,7 @@ except ImportError:
     uctypes = None
 
 HERE = __file__.rsplit("/", 1)[0] if "/" in __file__ else "."
-SHOW = ("neon_grid.sid", "aurec-jazz.wav")
+SHOW = ("neon_grid.sid", "aurec-jazz.qoa")
 
 # Where the sound module keeps its data (vixen_sound.c): chip RAM window
 # SND_BASE = 0x380000; the SID register shadow at +0x10400, WAV data at +0x11000.
@@ -43,7 +46,8 @@ WAV_BASE = CHIP + 0x380000 + 0x11000
 WAV_MAX = 0x7F0000 - 0x391000
 PCM_MAX_RATE = 48007
 
-W, H = 384, 224
+import vixen
+W, H = vixen.screen_size()     # inside the console margins
 SIN = [int(1024 * math.sin(2 * math.pi * i / 256)) for i in range(256)]
 
 
@@ -61,6 +65,9 @@ def play_file(name, seconds=30):
     elif low.endswith(".wav"):
         sound.wav.play(name)
         playing = sound.wav.playing
+    elif low.endswith(".qoa"):
+        sound.qoa.play(name)
+        playing = sound.qoa.playing
     else:
         return
     print("playing", name)
@@ -90,21 +97,55 @@ def _wav_info(path):
     with open(path, "rb") as f:
         head = f.read(4096)
     pos, ch, rate, bits, data = 12, 1, 22050, 8, 0
+    adpcm, align, fact = False, 1, None
     while pos + 8 <= len(head):
         tag, size = head[pos:pos + 4], int.from_bytes(head[pos + 4:pos + 8], "little")
         if tag == b"fmt ":
+            adpcm = int.from_bytes(head[pos + 8:pos + 10], "little") == 0x11
             ch = int.from_bytes(head[pos + 10:pos + 12], "little")
             rate = int.from_bytes(head[pos + 12:pos + 16], "little")
+            align = int.from_bytes(head[pos + 20:pos + 22], "little")
             bits = int.from_bytes(head[pos + 22:pos + 24], "little")
+        elif tag == b"fact":
+            fact = int.from_bytes(head[pos + 8:pos + 12], "little")
         elif tag == b"data":
             data = size
             break
         pos += 8 + size + (size & 1)
     decim = (rate + PCM_MAX_RATE - 1) // PCM_MAX_RATE
-    frames = data // (ch * bits // 8) // decim
+    if adpcm:
+        # IMA ADPCM: blocks of a 4-byte header per channel + 8 samples per 4 bytes
+        hd = 4 * ch
+        frames = data // align * ((align - hd) * 2 // ch + 1)
+        if data % align >= hd:
+            frames += (data % align - hd) // hd * 8 + 1
+        if fact is not None:
+            frames = min(frames, fact)
+        frames //= decim
+    else:
+        frames = data // (ch * bits // 8) // decim
+    return _layout(ch, rate, frames if data else None, bits > 8 or adpcm, bits)
+
+
+def _qoa_info(path):
+    """The same for a QOA file (16 bit)."""
+    with open(path, "rb") as f:
+        head = f.read(16)
+    frames, ch = int.from_bytes(head[4:8], "big"), head[8]
+    rate = int.from_bytes(head[9:12], "big")
+    return _layout(ch, rate, frames // ((rate + PCM_MAX_RATE - 1) // PCM_MAX_RATE), True, 16)
+
+
+def _layout(ch, rate, frames, wide, bits):
+    """frames: output samples per channel (None: unknown); wide: more than
+    8 bit in the file."""
     cap = (WAV_MAX // ch) & ~3
-    out16 = bits > 8 and frames <= cap // 2
-    return ch, rate // decim, out16, frames, cap, bits
+    if frames is None or frames > cap:
+        # too long even for 8 bit: it streams through a ring of cap // 2 16-bit
+        # samples, frame n in slot n % ring -- so "frames" is the ring here
+        return ch, rate, True, cap // 2, cap, bits
+    decim = (rate + PCM_MAX_RATE - 1) // PCM_MAX_RATE
+    return ch, rate // decim, wide and frames <= cap // 2, frames, cap, bits
 
 
 def _sid_info(path):
@@ -156,7 +197,8 @@ BLIT_DST, BLIT_DIMS, BLIT_MOD, BLIT_CTRL, BLIT_STATUS = (
 GFX_PTR = 0x3A000158
 FBS = (0x300000, 0x320000, 0x340000)   # the LVGL driver's framebuffers (vx_lvgl.c)
 STRIDE = 512
-DRAW_H = 186                           # rows the pictures use; the titles sit below
+ORG = vixen.console_margin()[2] * STRIDE   # LVGL draws from row `top` (vx_lvgl.c)
+DRAW_H = H - 38                        # rows the pictures use; the titles sit below
 
 
 def rgb(r, g, b):
@@ -201,7 +243,7 @@ class _Gfx:
         self.fb = FBS[self.k]
         self._idle()
         m[BLIT_MOD] = (STRIDE - W) << 16
-        m[BLIT_DST] = self.fb
+        m[BLIT_DST] = self.fb + ORG
         m[BLIT_DIMS] = (DRAW_H << 16) | W
         m[BLIT_CTRL] = 0x03            # fill with colour 0
         self._idle()
@@ -210,7 +252,7 @@ class _Gfx:
     def poly(self, xs, ys, n, colour):
         """Lines through the first n points (already clipped to the area)."""
         m = self.m
-        fb = self.fb
+        fb = self.fb + ORG
         go = (colour << 8) | 0x11      # line, go
         x0, y0 = xs[0], ys[0]
         for i in range(1, n):
@@ -375,57 +417,118 @@ class _Harmonograph:
 SID_SECONDS = 62      # a SID tune loops forever: two passes of Neon Grid
 
 
-def _length(path, seconds):
+def _length(path, seconds, sid_seconds=None):
     if seconds:
         return seconds
-    return SID_SECONDS if path.lower().endswith(".sid") else 3600   # a WAV ends by itself
+    if path.lower().endswith(".sid"):
+        return sid_seconds or SID_SECONDS
+    return 3600                                 # a WAV/QOA ends by itself
 
 
-def art(*names, seconds=None, fps=25):
-    """Play WAV/SID files with pictures (LVGL build). seconds=None: a WAV to
-    its end, a SID for SID_SECONDS."""
+def _key_poller():
+    """Single keys from the console (keyboard or SSH) without waiting, or None."""
+    try:
+        import select
+        import sys
+        p = select.poll()
+        p.register(sys.stdin, select.POLLIN)
+        return p
+    except (ImportError, AttributeError, OSError):
+        return None
+
+
+def _key(poller):
+    if poller and poller.poll(0):
+        import sys
+        return sys.stdin.read(1)
+    return None
+
+
+def art(*names, seconds=None, fps=25, sid_seconds=None, keys=True):
+    """Play WAV/QOA/SID files with pictures (LVGL build; without LVGL they just
+    play). seconds=None: a WAV/QOA to its end, a SID for sid_seconds (default
+    SID_SECONDS). A file that cannot be played is skipped. keys: SPACE pauses
+    and resumes, n skips to the next file, p (or r) goes back one."""
     names = names or SHOW
     try:
         import lvgl as lv
     except ImportError:
         lv = None
-    if lv is None or uctypes is None:
-        for n in names:
-            play_file(_path(n), _length(n, seconds))
-        return
+    if uctypes is None:
+        lv = None
+    poller = _key_poller() if keys else None
     stage = None
+    cur, way = 0, 1                     # way: where to go past a file that does not play
     try:
-        for name in names:
+        while cur < len(names):
+            name = names[cur]
             path = _path(name)
-            old = stage
-            stage = _Stage(lv)
-            if old:
-                old.scr.delete()
-            if path.lower().endswith(".wav"):
-                info = _wav_info(path)
-                stage.labels(name.rsplit("/", 1)[-1], "%d Hz %s, %d bit" % (
-                    info[1], "stereo" if info[0] == 2 else "mono", info[5]))
-                pic = _Rosette(_Gfx(lv, stage.scr), info)
-                sound.wav.play(path)
-                playing = sound.wav.playing
-            else:
-                title, author, released, clock = _sid_info(path)
-                stage.labels(title, "%s  -  %s" % (author, released))
-                pic = _Harmonograph(_Gfx(lv, stage.scr), clock)
-                sound.sid.play(path)
-                playing = sound.sid.playing
+            if lv:
+                old = stage
+                stage = _Stage(lv)
+                if old:
+                    old.scr.delete()
+            low = path.lower()
+            pic = None
+            try:
+                if low.endswith(".wav") or low.endswith(".qoa"):
+                    qoa = low.endswith(".qoa")
+                    if lv:
+                        info = _qoa_info(path) if qoa else _wav_info(path)
+                        stage.labels(name.rsplit("/", 1)[-1], "%d Hz %s, %s" % (
+                            info[1], "stereo" if info[0] == 2 else "mono", "QOA" if qoa else "%d bit" % info[5]))
+                        pic = _Rosette(_Gfx(lv, stage.scr), info)
+                    player = sound.qoa if qoa else sound.wav
+                elif low.endswith(".sid"):
+                    if lv:
+                        title, author, released, clock = _sid_info(path)
+                        stage.labels(title, "%s  -  %s" % (author, released))
+                        pic = _Harmonograph(_Gfx(lv, stage.scr), clock)
+                    player = sound.sid
+                else:
+                    raise ValueError("not a WAV, QOA or SID file")
+                player.play(path)
+            except (OSError, ValueError) as e:     # not a file the sound module takes
+                print("skipped:", name, "-", e)
+                cur += way
+                if cur < 0:
+                    cur, way = 0, 1
+                continue
+            print("playing", name)
+            nxt, way = cur + 1, 1
             t0 = time.ticks_ms()
-            frame_ms = 1000 // fps
-            limit = _length(path, seconds) * 1000
-            while playing():
-                t = time.ticks_diff(time.ticks_ms(), t0)
+            paused_at, paused_ms = None, 0
+            frame_ms = 1000 // fps if pic else 50
+            limit = _length(path, seconds, sid_seconds) * 1000
+            while player.playing():
+                k = _key(poller)
+                if k == " ":
+                    if paused_at is None:
+                        player.pause()
+                        paused_at = time.ticks_ms()
+                        print("paused - SPACE plays on")
+                    else:
+                        player.resume()
+                        paused_ms += time.ticks_diff(time.ticks_ms(), paused_at)
+                        paused_at = None
+                elif k in ("n", "N"):
+                    break
+                elif k in ("p", "P", "r", "R"):
+                    nxt, way = max(cur - 1, 0), -1  # back one (the first: again)
+                    break
+                if paused_at is not None:
+                    time.sleep_ms(20)
+                    continue
+                t = time.ticks_diff(time.ticks_ms(), t0) - paused_ms
                 if t > limit:
                     break
-                pic.frame(t)
-                wait = frame_ms - (time.ticks_diff(time.ticks_ms(), t0) - t)
+                if pic:
+                    pic.frame(t)
+                wait = frame_ms - (time.ticks_diff(time.ticks_ms(), t0) - paused_ms - t)
                 time.sleep_ms(wait if wait > 1 else 1)   # the SID player runs meanwhile
             sound.sid.stop()
             sound.wav.stop()
+            cur = nxt
     finally:
         sound.sid.stop()
         sound.wav.stop()

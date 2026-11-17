@@ -2,9 +2,13 @@
 # Copyright (c) 2025-2026 Robert S. (aka Robmaster)
 """Display model for vxemu: VIH registers, palette, tile layer, GFX layer and
 the blitter's FILL/COPY/LINE, rendered to a PNG at the VIXEN-32's native 384x224.
+In hi-res text mode (VIDEO_MODE, core v0.95) the PNG is 768x224: the tile
+layer per dot (half a pixel) from its 128-cell map, everything else doubled.
+The hi-res layer sits 24 dots further left than the devkit describes
+(HIRES_DX, measured on core v0.98; uart.c's CON_HIRES_DX).
 
 Used by vxemu.py when VX_SCREEN is set. Not modelled: sprites (the LVGL mouse
-cursor), the border (the port runs borderless), 8x16 and uploaded fonts,
+cursor), 8x16 and uploaded fonts,
 8bpp glyphs, copper. The 8x8 ROM font is the MEGA65 ASCII font by deft; it
 ships with the VIXEN-32 core source (rtl/font_rom.hex) and is read from
 there (VX_FONT), not copied into this repository.
@@ -26,8 +30,12 @@ DEFAULT_PALETTE = [
 
 # register offsets from 0x3A000000
 BORDER_COLOR, BG_COLOR, FONT_CTRL, TILE_SCROLL = 0x104, 0x108, 0x110, 0x11C
+BORDER_DIMS = 0x130
 TILE_PRIORITY, TILES_ENABLE, GFX_ENABLE, PALETTE = 0x124, 0x12C, 0x134, 0x154
 GFX_PTR, GFX_SCROLL, TILEMAP_PTR = 0x158, 0x15C, 0x16C
+VIDEO_MODE = 0x298
+PAL_SEL, BLIT_CBASE, BLIT_LUT = 0x294, 0x1D0, 0x1D4
+HIRES_DX = 24            # dots
 BLIT_SRC, BLIT_DST, BLIT_DIMS, BLIT_MOD, BLIT_CTRL = 0x1A0, 0x1A4, 0x1A8, 0x1AC, 0x1B0
 MAP0, MAP1 = 0x38A00, 0x40200
 SHOT = 0x1FFFF0          # emulator-only: a write takes a screenshot
@@ -39,6 +47,8 @@ def rgb565(v):
 
 
 def load_font(path):
+    if not path:                       # no font: text renders blank (blitter tests)
+        return bytes(256 * 16)
     rows = [int(l.split()[0], 16) for l in open(path) if l.strip() and not l.startswith("//")]
     return bytes(rows)
 
@@ -57,13 +67,19 @@ def write_png(path, w, h, rgb):
 class Screen:
     def __init__(self, uc, regs, font_path):
         self.uc, self.regs = uc, regs          # regs: vxemu's dict of MMIO writes
-        self.pal = list(DEFAULT_PALETTE)
+        self.pal = [list(DEFAULT_PALETTE) for _ in range(8)]   # 8 x 256 (core v0.95)
+        self.lut, self.lut_on = list(range(256)), False
         self.font = load_font(font_path)
 
     def write(self, off, value):
         """MMIO write hook; returns True if handled here."""
         if off == PALETTE:
-            self.pal[(value >> 16) & 0xFF] = value & 0xFFFF
+            self.pal[(value >> 24) & 7][(value >> 16) & 0xFF] = value & 0xFFFF
+        elif off == BLIT_LUT:
+            if value & 0x80000000:
+                self.lut_on = bool(value & 1)
+            else:
+                self.lut[(value >> 8) & 0xFF] = value & 0xFF
         elif off == BLIT_CTRL and value & 1:
             self.blit(value)
         return False
@@ -86,11 +102,13 @@ class Screen:
                 uc.mem_write(d, bytes([key]) * w)
                 continue
             row = bytes(uc.mem_read(src + y * (w + smod), w))
-            if ctrl & 4:                         # colour key
+            cbase = r.get(BLIT_CBASE, 0) & 0xFF
+            if ctrl & 4 or cbase or self.lut_on:  # key on the raw byte, then + cbase, then the LUT
                 old = bytearray(uc.mem_read(d, w))
                 for i, p in enumerate(row):
-                    if p != key:
-                        old[i] = p
+                    if not (ctrl & 4 and p == key):
+                        q = (p + cbase) & 0xFF
+                        old[i] = self.lut[q] if self.lut_on else q
                 row = bytes(old)
             uc.mem_write(d, row)
 
@@ -110,40 +128,59 @@ class Screen:
 
     def render(self, path):
         r = self.regs
-        pal = [rgb565(v) for v in self.pal]
+        ps = r.get(PAL_SEL, 0)                   # palette per layer: picture, tiles, border
+        pal_g = [bytes(rgb565(v)) for v in self.pal[ps & 7]]
+        pal_t = [bytes(rgb565(v)) for v in self.pal[(ps >> 4) & 7]]
+        pal_b = [bytes(rgb565(v)) for v in self.pal[(ps >> 12) & 7]]
         bg = r.get(BG_COLOR, 6) & 0xFF
         gfx_on = r.get(GFX_ENABLE, 0) & 1
         tiles_on = r.get(TILES_ENABLE, 1) & 1
         tiles_top = r.get(TILE_PRIORITY, 1) & 1
         fb = bytes(self.uc.mem_read(CHIP + (r.get(GFX_PTR, 0) & 0x1FFF) * 4096, 512 * 256)) if gfx_on else b""
         gs = r.get(GFX_SCROLL, 0)
-        gx, gy = (gs & 0x1FF) & ~7, (gs >> 16) & 0xFF   # fine X is the hardware's own offset
+        gx, gy = gs & 0x1FF, (gs >> 16) & 0xFF   # column x lands on screen x (core v0.95+)
         ts = r.get(TILE_SCROLL, 0)
         tx, ty = ts & 0x1FF, (ts >> 16) & 0x1FF
         base = r.get(TILEMAP_PTR, 0) & 0x7F
+        bd = r.get(BORDER_DIMS, 0)
+        bl, br = bd & 0xFF, (bd >> 8) & 0xFF
+        bt, bb = max(1, (bd >> 16) & 0xFF), max(1, bd >> 24)   # top/bottom 0 is stored as 1 (v0.78)
+        border = pal_b[r.get(BORDER_COLOR, 14) & 0xFF]
         font = self.font
-        img = bytearray(W * H * 3)
+        hires = r.get(VIDEO_MODE, 0) & 1
+        ow = 2 * W if hires else W           # output width: dots in hi-res
+        img = bytearray(ow * H * 3)
         for y in range(H):
-            trow = (base + ((y + ty) >> 3)) & 0x7F
-            win = (MAP0 + trow * 256) if trow < 64 else (MAP1 + (trow - 64) * 256)
+            if hires:                         # text row R = map rows 2R, 2R + 1: 128 cells
+                trow = (base // 2 + ((y + ty) >> 3)) & 0x3F
+                win = (MAP0 + trow * 512) if trow < 32 else (MAP1 + (trow - 32) * 512)
+            else:
+                trow = (base + ((y + ty) >> 3)) & 0x7F
+                win = (MAP0 + trow * 256) if trow < 64 else (MAP1 + (trow - 64) * 256)
             py = (y + ty) & 7
             frow = ((y + gy) & 0xFF) * 512
-            for x in range(W):
+            for xo in range(ow):
+                x = xo >> 1 if hires else xo     # pixel, for border and GFX
+                o = (y * ow + xo) * 3
+                if x < bl or x >= W - br or y < bt or y >= H - bb:
+                    img[o:o + 3] = border
+                    continue
                 t = 0
                 if tiles_on:
-                    cell = r.get(win + (((x + tx) >> 3) & 63) * 4, 0)
+                    mx = xo + tx + (HIRES_DX if hires else 0)
+                    tcol = (mx >> 3) & (127 if hires else 63)
+                    cell = r.get(win + tcol * 4, 0)
                     ch = (cell & 0xFF) | ((cell >> 18) & 0x100)
                     bits = font[(ch & 0xFF) * 16 + (7 - py if cell & (1 << 25) else py)]   # ROM: 256 chars x 16 rows
-                    px = (x + tx) & 7
+                    px = mx & 7
                     if cell & (1 << 24):
                         px = 7 - px
                     t = (cell >> 8) & 0xFF if (bits >> (7 - px)) & 1 else (cell >> 16) & 0xFF
                 g = fb[frow + ((x + gx) & 511)] if gfx_on else 0
                 if tiles_top:
-                    c = t or g or bg
+                    c = pal_t[t] if t else pal_g[g or bg]
                 else:
-                    c = g or t or bg
-                o = (y * W + x) * 3
-                img[o:o + 3] = bytes(pal[c])
-        write_png(path, W, H, img)
+                    c = pal_g[g] if g else (pal_t[t] if t else pal_g[bg])
+                img[o:o + 3] = c
+        write_png(path, ow, H, img)
         return path

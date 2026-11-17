@@ -65,7 +65,7 @@ class Display:
     """A row of digits. ':' and '.' take a narrow cell of their own.
 
     layout is a template such as "88:88" (default: chars digits); x=None
-    centres the row in a 384 pixel wide parent."""
+    centres the row on the screen (vixen.screen_size())."""
 
     def __init__(self, parent, x, y, height, chars=4, color=None, layout=None):
         color = color or lv.color_hex(0x40C0FF)
@@ -74,7 +74,8 @@ class Display:
         gap = max(3, height // 8)
         self.width = sum(t if c in ":." else height // 2 for c in layout) + gap * (len(layout) - 1)
         if x is None:
-            x = (384 - self.width) // 2
+            import vixen
+            x = (vixen.screen_size()[0] - self.width) // 2
         self.x = x
         self.cells = []
         for c in layout:

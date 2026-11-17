@@ -412,8 +412,11 @@
 #define LV_USE_CHECK_ARG            0
 
 /** Add a custom handler when assert happens e.g. to restart MCU. */
+/* VIXEN-32: a failed check raises RuntimeError in Python (vx_lvgl_mp.c)
+ * instead of halting -- a halt also stops the network and the console, e.g.
+ * lv.obj() before vixen.lv_display() froze the machine for good. */
 #define LV_ASSERT_HANDLER_INCLUDE <stdint.h>
-#define LV_ASSERT_HANDLER while(1);     /**< Halt by default */
+#define LV_ASSERT_HANDLER { extern void vx_lvgl_assert_failed(void); vx_lvgl_assert_failed(); while (1); }
 #define LV_DISABLE_ASSERT_HANDLER_INCLUDE_WARNING 1
 
 /*-------------

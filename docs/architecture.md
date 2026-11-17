@@ -31,13 +31,84 @@ Layout (`mcu/rv32/vixen.ld`):
     0x00000100  .text/.rodata/.data/.sdata/.sbss   code + globals  (~340 KB, BRAM)
     0x40000000  .bss / .Heap                       zeroed at startup, libc _sbrk
     0x40800000  .Stack                             C call stack, grows DOWN (8 KB)
-    0x40900000  .gcram                             MicroPython gc arena (1 MB)
+    0x40900000  .gcram                             MicroPython gc arena (6 MB, up to 0xF00000)
 
 The image is entered at `_start == 0x100` (BRAM). `.bss`/`.Heap`/`.Stack`/`.gcram`
 are NOLOAD: they are reserved in chip-RAM but stored nowhere in the image --
 `entrypoint.s` zeroes bss and fills the stack canary, `main.c` zeroes the gc arena
 before `gc_init`. Because the heap carries no bytes, the `.rvk` is a single BRAM
 code block, exactly like `apptest.rvk`.
+
+### Instruction cache
+
+Core v0.88+ has an 8 KB instruction cache for code fetched above the BRAM:
+Trapdoor RAM and the chip-RAM window. `main.c` switches it on at start (the
+kernel switches it off at every .rvk launch; older cores ignore the write).
+It speeds up all code in `.chiptext` and native code on the heap; code in
+BRAM runs as before. New machine code must be followed by a cache
+invalidate (see below).
+
+Measured on the MEGA65 (core v0.98, LVGL + network build): `compile()` of
+weather.py 3x 1.37 s -> 0.865 s with the cache -> 0.77 s with the compiler in
+BRAM as well; json dumps/loads 40x 1.33 s -> 1.15 s; an LVGL full refresh is
+unchanged (its renderer is in BRAM).
+
+### Floats on the co-processor
+
+The CPU has no FPU (rv32im, soft-float ABI), so gcc calls libgcc's
+`__addsf3` & co. for every float operation. `mcu/rv32/vixfloat.c` defines
+add, subtract, multiply, divide and the int conversions on the core's float
+co-processor instead (core v0.57+, `VIH_FPU_*`): write A, write B to
+`GO(op)`, read the result -- the read stalls until it is ready, no polling.
+MicroPython's floats are single precision, so this is every Python float
+operation, libm and the float formatting and parsing; comparisons stay
+libgcc's. Measured on the MEGA65 (core v0.98): a float arithmetic loop
+1.62 s -> 1.10 s, `math.sin`/`cos`/`sqrt` 2.09 s -> 0.84 s. The firmware is
+6 KB smaller.
+
+The numbers are IEEE-754 binary32 with round to nearest even, as libgcc --
+except that denormals (|x| < 1.18e-38) are flushed to zero (`1e-40` reads
+as `0.0`) and a NaN result is the canonical quiet NaN. Not reentrant: no
+interrupt handler may use floats (the port's are empty). The emulator
+models the unit (`fpu_op()` in `vxemu.py`); the same checks gave the same
+results on the hardware.
+
+### Native code without the C extension
+
+The VIXEN core is rv32im without the C (compressed) extension, and
+MicroPython's RV32 emitter uses compressed instructions wherever they fit --
+even the simplest `@micropython.viper` function had one (found with the
+emulator's `VX_RVC=1`, which stops at the first compressed instruction;
+Unicorn itself runs them). `patches/micropython-rv32-norvc.patch` (applied by
+`setup.sh`) adds `MICROPY_EMIT_RV32_RVC`: at 0, as this port sets it, every
+`asm_rv32_opcode_c*()` emits the 32-bit instruction it stands for (the
+3-bit register window mapped back to x8-x15), and the one sequence with a
+skip distance counted in 2-byte opcodes takes its 32-bit form. Code is a
+little bigger, nothing else changes. So `@micropython.native`,
+`@micropython.viper`, `@micropython.asm_rv32` and native `.mpy` files work;
+`tests/test_native.py` runs them in the emulator with `VX_RVC=1` and passed
+on the MEGA65 (core v0.98). New machine code goes through
+`MP_PLAT_COMMIT_EXEC` (`vixen_commit_exec()` in `main.c`), which applies the
+relocations and invalidates the caches: the instruction cache is on.
+
+### The gc heap grows into Zorro RAM
+
+Core v0.89+ has 48 MB more SDRAM at `0x41000000` (Zorro RAM): CPU only, as
+fast as chip RAM, invisible to the blitter, video and audio. Python objects
+never go to that hardware (framebuffers, sound and sprites use fixed chip-RAM
+windows), so the gc heap may live there. The 6 MB chip-RAM arena stays the
+first area. When a collection cannot free enough for an allocation, gc.c
+(`MICROPY_GC_SPLIT_HEAP_AUTO`) adds an area that doubles the heap
+(6 -> 12 -> 24 -> 48 MB more, up to 54 MB in all) and hands an area back once
+a collection leaves it empty. A collection only walks the used part of each
+area, so a program that stays small pays nothing for the space.
+
+The areas come from the kernel's allocator (`ksys_alloc_mem(KMEM_ZORRO, ...)`,
+`main.c`), so Zorro RAM that a kernel module takes is respected. Without the
+kernel call or without Zorro RAM (older cores) the heap stays at 6 MB.
+`gc.mem_free()` counts the Zorro RAM that is still free (MicroPython adds
+the room the heap can still grow by); `micropython.mem_info()` shows the
+areas that exist now and, as "max new split", that room.
 
 ## ld quirks worked around in vixen.ld
 
@@ -65,14 +136,43 @@ absolute addressing.
 VIXEN-32 has no UART; `uart.c` implements the MicroPython console on the VIH
 hardware directly.
 
-**Screen.** A 48x28 software screen -- the whole visible tile grid, 384x224 px,
-no border -- is mirrored into tile map 0 (built-in 8x8 ROM font, one 32-bit cell
-per character). Earlier versions used 40x25 inside a border because the top
-tile row always looked cut by ~4 lines; the cause was the tile scroll that
-`vih_init_registers()` sets (x=1, y=4 pixels, moving the text layer up and left).
-`uart_init()` sets it to 0,0 (`TILE_SCROLL_X/Y`); `vixen.tile_scroll(x, y)`
-changes it at run time, e.g. to find an offset should the hardware need one
-(the GFX layer, by comparison, needs a fine X scroll of 4 without a border).
+**Screen.** A 92x27 (hi-res) or 46x27 software screen (368x216 px) is mirrored into tile map 0
+(built-in 8x8 ROM font, one 32-bit cell per character). Around it are
+margins -- the border, in the console's background colour: left 9, right 7,
+top 4, bottom 4 pixels by default (`CON_MARGIN_L/R/T/B` in `uart.c`). The
+text starts in map row ceil(top / 8); the tile scroll (512 - left,
+8 * that row - top) puts its first cell at screen (left, top). x wraps round
+the 512-pixel map line; y stays positive.
+
+Why the margins: since core v0.94 HDMI is 720x576 with the 384 pixels across
+the whole width (v0.76 sent 720p with black bars beside the 4:3 picture). On
+the HDMI TV this was tuned on, the left ~8 px and the right ~2 px are cut
+off. At the top and bottom the core keeps at least one border line (v0.78),
+which hid the first pixel line of a text row at y = 0.
+
+`vixen.console_margin(left, right, top, bottom)` (each 0-64) sets other
+margins; columns = (384 - left - right) // 8, rows = (224 - top - bottom) // 8,
+the remainder goes to the right / bottom margin, and the screen is cleared.
+`vixen.console_margin()` returns the four as they are. On a 1084S or a TV that
+shows the whole picture, `vixen.console_margin(0, 0, 0, 0)` in `boot.py` gives
+48x28. `vixen.screen_size()` returns the area inside the margins,
+`(368, 216)`. `vixen.tile_scroll(x, y)` still overrides the scroll by hand.
+
+**80-column mode, C128 style.** The console starts in hi-res text (core
+v0.95+): the tile layer draws 768 dots a line (a dot = half a pixel) from a
+map 128 cells wide, so the same 368x216 area holds twice the columns:
+**92x27** (46x27 in lo-res). **CAPS LOCK** switches between the two -- every
+press, locking or releasing, like the C128's 40/80 key (the keyboard only
+reports changes, so its position at start-up is unknown; CAPS LOCK is not a
+caps lock in this port, SHIFT works as usual). `vixen.console_hires(on)` does
+the same from Python, `vixen.console_hires()` and `vixen.console_size()`
+(`(92, 27)`) tell the state. The text stays when switching; lo-res keeps the
+left half of long lines. Measured on core v0.98: the hi-res layer sits
+24 dots (3 cells) further left than the devkit describes; `CON_HIRES_DX` in
+`uart.c` makes up for it (the emulator models the same). Borders, margins and
+`screen_size()` do not change, nor does LVGL. Older cores ignore the mode
+and show only the left half of the hi-res columns: `vixen.console_hires(False)`
+in `boot.py` there.
 Writing `border_dims`/`tile_scroll` claims sticky ownership of the registers --
 fine, the port runs no copper.
 
@@ -91,6 +191,9 @@ from the VM (`MICROPY_VM_HOOK_POLL`, every 64 bytecodes), so type-ahead is not
 lost while code runs.
 
 * INST/DEL is backspace, the cursor keys send `ESC [ A/B/C/D`.
+* CAPS LOCK switches the console between 92 and 46 columns (above). It is
+  key 72 and latches: make when it locks, break when it is released; key 78
+  is the press itself.
 * MEGA (C=) or ALT + `:` `;` `£` `-` `@` type `{` `}` `|` `~` `` ` `` -- characters
   the MEGA65 keyboard has no key for, which Python needs.
 * Ctrl+letter gives ^A..^Z (an earlier version subtracted 'A' from the
@@ -126,11 +229,16 @@ card (`VfsFat` over raw sectors) would work from stale caches and could corrupt
 it. Long file names, sub-directories and the kernel's per-unit current directory
 come for free.
 
+Names come from the kernel as 8-bit bytes; one that is not valid UTF-8 (a
+Latin-1 name copied from a PC) is listed with each byte 0x80-0xFF as
+U+0080-U+00FF, and a path that does not exist as UTF-8 is retried with those
+characters as single bytes -- so every listed name opens (`disk_path()`).
+
 At startup (and after a soft reset) `vixen_disk_automount()` mounts every unit
 that answers:
 
     /sd   unit 3 (vixen.UNIT_SD)  the SD card itself
-    /a    unit 0 (vixen.UNIT_A)   disk image in drive A: (F12 menu)
+    /a    unit 0 (vixen.UNIT_A)   disk image in drive A: (HELP browser)
     /b    unit 1 (vixen.UNIT_B)   disk image in drive B:
 
 Absent, unformatted or disabled units are skipped silently. When `/sd` is
@@ -147,27 +255,27 @@ Supported: `open()` in `'r'`/`'w'` (text or binary), `read`/`readinto`/
 
 Limits that come from the kernel API:
 
-* **Drive C: (unit 3) must be enabled in BOOT.BIN.** Since BOOT.BIN build 119 the
-  SD card unit is switched off by default (`VX_DRIVE_C` in `risc/basic_test.c`)
-  and the kernel answers "no such unit"; `/sd` then does not appear. A: and B:
+* **Drive C: (unit 3) must be enabled in the kernel.** The core v0.98
+  `KERNEL.BIN` enables it. Kernel builds 119 and later could switch it off
+  (`VX_DRIVE_C`); the kernel then answers "no such unit" and `/sd` does not
+  appear. A: and B:
   work regardless. With C: enabled, the kernel may restrict *writes* to
   `/VIXEN-32/` (the same jail SAVE uses).
 * No append and no read+write handles: modes `'a'`, `'+'` and `'x'` raise
   `OSError(EOPNOTSUPP)`.
 * No fsync: written data is committed when the file is closed.
-* **SD card ownership.** Any kernel access to unit 3 claims the card from the
-  MEGA65 side and keeps it until `kdisk_release()`. While it is held, pressing
-  F12 stops the core with "SD Card: Unknown error while trying to browse. Error
-  code: 3707". The driver therefore releases the card after every operation, as
-  BASIC does -- except while one of its files is open on the card, because a
-  release unmounts the filesystem the handle depends on. **Close files before
-  pressing F12**; use `with open(...)` (the GC closes forgotten files only
-  eventually). `ilistdir()` reads the whole directory and closes it at once.
+* **SD card ownership.** Any kernel access to unit 3 claims the card and keeps
+  it until `kdisk_release()`. (Up to core v0.93 the MEGA65 side shared the card,
+  and F12 stopped the core while it was held; since v0.94 the F12 menu is gone
+  and the kernel is alone on the card.) The driver releases the card after every
+  operation, as BASIC does -- except while one of its files is open on the card,
+  because a release unmounts the filesystem the handle depends on. Use
+  `with open(...)` (the GC closes forgotten files only eventually). `ilistdir()` reads the whole directory and closes it at once.
 * Because a release unmounts the kernel's filesystem, the kernel's own current
   directory is not used: each `Disk` keeps its cwd itself (`os.chdir`) and passes
   the kernel absolute, normalised paths only (`.` and `..` are resolved by the
   driver).
-* Only the services the installed BOOT.BIN exports are used; a missing kernel
+* Only the services the installed KERNEL.BIN exports are used; a missing kernel
   entry raises `OSError(ENODEV)` instead of jumping to address 0.
 
 ## LVGL (make LVGL=1)
@@ -178,7 +286,7 @@ The LVGL build adds the `lvgl` module from
 VIXEN hardware. Without `LVGL=1` none of it is built in.
 
     import lvgl as lv, vixen     # the import runs lv_init()
-    vixen.lv_display()           # 384x224 display + mouse; console hidden
+    vixen.lv_display()           # 368x216 display + mouse; console hidden
     b = lv.button(lv.screen_active())
     lv.label(b).set_text("Hello VIXEN")
     b.center()
@@ -217,17 +325,27 @@ VIXEN hardware. Without `LVGL=1` none of it is built in.
 **Display driver** (`vx_lvgl.c`, `vx_lvgl_mp.c`; tuned on the MEGA65): RGB565 rendering into a 384x24 BRAM
 buffer, conversion through a 64 KB table to a 256-colour palette (6x6x6 cube +
 40 greys), triple buffering with blitter sync, areas rounded to 4-pixel
-columns, GFX fine X scroll 4 (needed without a border).
+columns. The display is the console's area inside its margins (368x216 by
+default, taken from `vixen.console_margin()` when `vixen.lv_display()`
+creates it); the GFX x scroll 512 - left puts framebuffer column 0 at
+screen x = left, LVGL draws from framebuffer row `top`, and the mouse sprite
+gets both offsets. (Up to core
+v0.94 the GFX layer also needed a fine X scroll of 4; core v0.95 fixed the
+picture's x position.)
 
 **Memory** (`mcu/rv32/vixen_lvgl.ld`). MicroPython + LVGL + binding are
 ~1.15 MB; BRAM holds 423 KB. BRAM keeps the hot paths -- LVGL's software
-renderer, refresh, style/area/colour helpers, font glyph lookup, the VM and
-object core, the port, libc -- plus the render buffer and the colour table
-(~392 KB in use). Everything else (binding, compiler, widgets, themes, font
-bitmaps, lodepng, extmod) runs from chip RAM through the cache, loaded as an
-sdram block of the .rvk. Chip RAM: .bss + libc heap 0x000000, sprite slots
+renderer, refresh, style/area/colour helpers, font glyph lookup, the VM,
+object core and compiler, the port, libc -- plus the render buffer (~403 KB
+in use). Everything else (binding, widgets, themes, font bitmaps, lodepng,
+extmod) runs from chip RAM through the data and instruction caches, loaded
+as an sdram block of the .rvk. The 64 KB colour table (RGB565 -> palette
+index, read once per pixel) is in Trapdoor RAM (core v0.87+, on-chip,
+2 clocks a read), from the kernel's allocator (`KMEM_TRAPDOOR`); without it,
+in chip RAM. It used to fill BRAM; there the compiler now runs. Chip RAM: .bss + libc heap 0x000000, sprite slots
 0x0E0000, code 0x100000-0x300000, framebuffers 0x300000, loader staging
-0x800000 (kept free), gc heap 4 MB at 0x900000. The C stack (16 KB) is in
+0x800000 (kept free), gc heap 6 MB at 0x900000 (up to the kernel modules at
+0xF10000), growing into Zorro RAM (see above). The C stack (16 KB) is in
 BRAM, after .bram_bss: every Python call keeps its frame there, and in chip
 RAM each store is a write-through to the SDRAM (half of all chip-RAM stores
 of an sshd transfer, measured in vxemu). Peak use measured: LVGL ~5.7 KB, TLS
@@ -308,22 +426,43 @@ from chip RAM).
 ## Sound (SOUND=1, on in every build with LVGL or the network)
 
     import sound
-    sound.wav.play("file.wav")             # loop=True repeats
+    sound.wav.play("file.wav")             # loop=False, stream=None (None: stream if too long)
     sound.wav.stop()
+    sound.qoa.play("file.qoa")             # same engine, same loop=/stream=
     sound.sid.play("file.sid")              # song=n picks a sub-tune
     sound.sid.stop()
     sound.wav.playing(), sound.sid.playing()
+    sound.wav.pause(), .resume(), .paused()  # also qoa and sid
 
 `play()` also takes a bytes-like object. Both run at the same time (PCM
 engine and SID are separate). Soft reset silences them.
 
 * **WAV** (`vixen_sound.c`): read completely into chip RAM, then played by
   the PCM engine on its own -- no CPU time while it plays. Integer PCM 8/16/
-  24/32 bit, mono or stereo, any rate; above 48 kHz decimated (the engine
+  24/32 bit and IMA ADPCM (decoded to 16 bit while loading, rounding as
+  ffmpeg), mono or stereo, any rate; above 48 kHz decimated (the engine
   plays at most one sample per 48 kHz mix tick). Stereo is voices 0/1 with
   the engine's 75/25 pan. Room: ~4.4 MB, i.e. ~47 s of 48 kHz 16-bit mono;
-  a file whose 16-bit copy does not fit is stored as 8 bit (twice as long),
-  beyond that `ValueError: WAV too long`.
+  a file whose 16-bit copy does not fit is stored as 8 bit (twice as long).
+  Longer files (or `stream=True`) stream: the window is a ring the engine
+  loops over, `vixen_sound_poll()` refills it from the open file (2 KB
+  per poll) behind the playback position, which is counted from the raster
+  clock because the engine has none to read (see `vixen_sound.c`,
+  "streaming"). The lead grows with the time played (half of it, up to 8 s),
+  so the start does not take the CPU away for seconds.
+* **QOA** (`sound.qoa`): decoded slice by slice into the same loader and
+  streaming path (codec CODEC_QOA), bit-exact to `qoa.h`; the inner loop
+  `qoa_run` and `qoa_dequant` sit in BRAM (linker scripts), like the ADPCM
+  loop.
+* **Pause**: the engine reads its control words live, so pitch 0 + volume 0
+  holds the position without a retrigger; the streaming clock stops with
+  `st.pitch = 0`. SID: the player is taken out of `vixen_sound_active` and
+  the master volume zeroed; on resume the queued write times and frame
+  clocks are shifted by the pause.
+* **nlr and locals**: `play()` keeps its source in a static, not a local.
+  `nlr_push()` returns twice and gcc does not know it; it kept a copy of a
+  local in a stack slot the inlined loader reused, and the error path closed
+  garbage. Any new nlr_push() user with an inlined callee: same rule.
 * **SID** (`vx_sidplay.h` on the 6502 core `vx6502.h`): PSID and RSID. The
   tune's init and play routine/interrupt handler run on a 64 KB C64 image;
   raster compare and CIA 1 timer A are modelled for the timing, the I/O area

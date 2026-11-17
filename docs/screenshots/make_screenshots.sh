@@ -28,24 +28,27 @@ PY=$EMU/venv/bin/python
     echo "import binascii, os, sys"
     echo "A = '/sd/vixen-32/apps/micropython'"
     echo "for d in ('examples', 'lib', '../../download'): sd.dirs.add(('vixen-32/apps/micropython/' + d).replace('apps/micropython/../../', ''))"
-    # the WAV cut to 8 s: the RAM /sd lives in the Python heap
-    "$PY" - "$EX/aurec-jazz.wav" "$W/aurec-jazz.wav" <<'PYEOF'
-import sys, struct
+    # the QOA cut to 74 frames of 5120 samples (7.9 s at 48 kHz): the RAM /sd lives in the Python heap
+    "$PY" - "$EX/aurec-jazz.qoa" "$W/aurec-jazz.qoa" <<'PYEOF'
+import sys
 d = open(sys.argv[1], "rb").read()
-i = d.index(b"data")
-rate, align = struct.unpack("<I", d[24:28])[0], struct.unpack("<H", d[32:34])[0]
-n = min(struct.unpack("<I", d[i + 4:i + 8])[0], rate * align * 8)
-body = d[12:i] + b"data" + struct.pack("<I", n) + d[i + 8:i + 8 + n]
-open(sys.argv[2], "wb").write(b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WAVE" + body)
+ch, n = d[8], 74
+fsize = int.from_bytes(d[14:16], "big")       # every frame but the last is full
+assert fsize == 8 + 16 * ch + 8 * ch * 256
+open(sys.argv[2], "wb").write(b"qoaf" + (n * 5120).to_bytes(4, "big") + d[8:8 + n * fsize])
 PYEOF
-    for f in "$EX"/*.py "$EX"/*.png "$EX"/*.sid "$W/aurec-jazz.wav"; do
+    for f in "$EX"/*.py "$EX"/*.png "$EX"/*.sid "$W/aurec-jazz.qoa"; do
         printf "with open(A + '/examples/%s', 'wb') as f: f.write(binascii.a2b_base64('%s'))\n" \
             "$(basename "$f")" "$(base64 -w0 "$f")"
     done
     echo "sys.path.append(A + '/lib'); sys.path.append(A + '/examples'); os.chdir(A)"
     # _cls(): clear the console and show the power-on banner again, so a
     # typed session starts on a clean screen (the set-up ran before it)
+    # lo-res (46 columns) for the text screens: square pixels in the PNG;
+    # the 92-column shots switch back with _hires()
+    echo "import vixen; vixen.console_hires(False)"
     echo "def _cls(): print('\x1b[2J\x1b[H' + sys.version.split('; ', 1)[1] + '; ' + sys.implementation._machine + '\nType \"help()\" for more information.')"
+    echo "def _hires(): vixen.console_hires(True); _cls()"
 } > "$W/setup.py"
 
 # ONLY="clock weather" re-makes just these
@@ -81,6 +84,59 @@ import wget
 wget.get("https://micropython.org/static/img/Mlogo_138wh.png")
 EOF
 
+# the default console since core v0.95: hi-res, 92 x 27 (PNG 768 x 224)
+typed console92 <<'EOF'
+_hires()
+help("modules")
+EOF
+
+typed sqlite <<'EOF'
+_hires()
+import sqlite3
+db = sqlite3.connect("scores.db")
+db.execute("CREATE TABLE score (name TEXT, points INTEGER)")
+rows = [("Ada", 4200), ("Grace", 3900), ("Alan", 2700)]
+db.executemany("INSERT INTO score VALUES (?, ?)", rows).rowcount
+db.commit()
+for row in db.execute("SELECT * FROM score ORDER BY points DESC"): print(*row)
+
+db.execute("SELECT COUNT(*), SUM(points), AVG(points) FROM score").fetchone()
+db.execute("SELECT sqlite_version()").fetchone()[0]
+db.close()
+import os; os.stat("scores.db")[6]
+EOF
+
+# the plasma of gfx_palette after some colour rotations (the module itself
+# runs until RUN/STOP, so its functions are used directly)
+shot gfx_palette 0 <<'EOF'
+import gfx, machine
+g = {}
+exec(open(A + "/examples/gfx_palette.py").read().replace("\nmain()\n", "\n"), g)
+cols = [g["gradient"](i) for i in range(256)]
+gfx.open()
+gfx.palette_show(1)
+for _ in range(2):
+    g["plasma"]()
+    gfx.flip()
+k = 96
+for i in range(256):
+    r, gr, b = cols[(i + k) & 255]
+    gfx.palette(i, r, gr, b, bank=1)
+machine.mem32[0x3A1FFFF0] = 0
+gfx.close()
+EOF
+
+# gfx_demo: the emulator has no blitter triangles, so this replays a frame
+# the MEGA65 drew (t = 0.9 s), captured with gfx_demo_capture.py
+{
+    echo "import gfx, uctypes, binascii, io, deflate"
+    printf "fb = deflate.DeflateIO(io.BytesIO(binascii.a2b_base64('%s')), deflate.ZLIB).read()\n" \
+        "$(base64 -w0 "$OUT/gfx_demo.fb.z")"
+    echo "gfx.open()"
+    echo "uctypes.bytearray_at(0x40320000, len(fb))[:] = fb   # the back buffer after open()"
+    echo "gfx.flip()"
+} | shot gfx_demo 0
+
 shot weather 3000 <<'EOF'
 import weather
 weather.show()
@@ -107,10 +163,10 @@ shot sound_wav 0 <<'EOF'
 import sys; sys.modules["sound_demo_quiet"] = True
 import sound_demo as D, lvgl as lv, sound, time, machine
 st = D._Stage(lv)
-info = D._wav_info(D.HERE + "/aurec-jazz.wav")
-st.labels("aurec-jazz.wav", "%d Hz stereo, %d bit" % (info[1], info[5]))
+info = D._qoa_info(D.HERE + "/aurec-jazz.qoa")
+st.labels("aurec-jazz.qoa", "%d Hz stereo, QOA" % info[1])
 pic = D._Rosette(D._Gfx(lv, st.scr), info)
-sound.wav.play(D.HERE + "/aurec-jazz.wav")
+sound.qoa.play(D.HERE + "/aurec-jazz.qoa")
 t0 = time.ticks_ms()
 while time.ticks_diff(time.ticks_ms(), t0) < 4000:
     pic.frame(time.ticks_diff(time.ticks_ms(), t0))
@@ -135,7 +191,8 @@ machine.mem32[0x3A1FFFF0] = 0      # the picture as it is drawn by the blitter
 sound.sid.stop(); sound.wav.stop()
 EOF
 
-# 2x copies (nearest neighbour) for the README: crisp pixels on big screens
+# 2x copies (nearest neighbour) for the README: crisp pixels on big screens.
+# Hi-res text shots (768 wide) already have half-width pixels: height only.
 "$PY" - "$OUT" <<'EOF'
 import sys, os, struct, zlib
 d = sys.argv[1]
@@ -148,14 +205,15 @@ for n in sorted(os.listdir(d)):
                     for i in range(8, len(data)) if data[i + 4:i + 8] == b"IDAT")
     raw = zlib.decompress(idat)
     rows = [raw[y * (w * 3 + 1) + 1:(y + 1) * (w * 3 + 1)] for y in range(h)]
+    sx = 1 if w >= 768 else 2
     big = []
     for r in rows:
-        line = b"".join(r[x * 3:x * 3 + 3] * 2 for x in range(w))
+        line = b"".join(r[x * 3:x * 3 + 3] * sx for x in range(w))
         big += [b"\0" + line] * 2
     def chunk(t, c):
         return struct.pack(">I", len(c)) + t + c + struct.pack(">I", zlib.crc32(t + c))
     with open(os.path.join(d, n[:-4] + "@2x.png"), "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w * 2, h * 2, 8, 2, 0, 0, 0))
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w * sx, h * 2, 8, 2, 0, 0, 0))
                 + chunk(b"IDAT", zlib.compress(b"".join(big), 9)) + chunk(b"IEND", b""))
     print("2x", n)
 EOF

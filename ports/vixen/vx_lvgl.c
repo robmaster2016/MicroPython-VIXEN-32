@@ -37,8 +37,12 @@
  *    two refreshes changed are copied over from the front buffer by the
  *    blitter.
  *  - Areas are rounded to 4-pixel columns: the flush writes whole words only.
- *  - GFX fine X scroll 4: needed on the MEGA65 without a border, else rows
- *    are shifted and the right edge wraps to the left (found on the hardware).
+ *  - The display is the console's area inside its margins (uart.c: 368x216
+ *    by default; vixen.console_margin() before vixen.lv_display() changes
+ *    it). The GFX x scroll 512 - left puts framebuffer column 0 at screen
+ *    x = left (the 512-pixel line is circular); LVGL draws from framebuffer
+ *    row `top`; the mouse sprite gets both offsets. Before core v0.95 the
+ *    picture also needed a fine X scroll of 4; the core fixed that.
  *  - The Amiga mouse in port 1 is an LVGL pointer; the cursor is hardware
  *    sprite channel 0, so moving it redraws nothing.
  *
@@ -51,7 +55,9 @@
 
 #include "lvgl/lvgl.h"
 #include "vih_regs.h"
+#include "kernel_api.h"
 #include "vx_lvgl.h"
+#include "uart.h"
 
 uintptr_t ticks_ms(void);
 void ticks_poll(void);
@@ -72,12 +78,15 @@ void uart_console_lvgl_palette(void);
 #define VX_LATCH_LINE    226u
 #endif
 
-/* GFX fine X scroll without a border (determined on the MEGA65). */
-#ifndef VX_GFX_XSCROLL
-#define VX_GFX_XSCROLL   4u
-#endif
-
 #define DRAW_BUF_LINES   24u
+/* The display: the console's area inside its side margins (uart.c), taken
+ * when the display is created. draw_buf is sized for the widest, 384. */
+static int32_t disp_w = VX_DISP_W;
+static int32_t disp_h = VX_DISP_H;
+static uint32_t disp_left;
+static uint32_t disp_top;
+static uint32_t disp_org;               /* framebuffer offset of display row 0 */
+
 static uint16_t draw_buf[VX_DISP_W * DRAW_BUF_LINES]
     __attribute__((aligned(8), section(".bram_bss")));
 
@@ -145,11 +154,51 @@ static inline uint32_t to_index(uint32_t c, uint32_t t) {
     return lut_r[r > 6u ? r - 6u : 0u] + lut_g[g > 6u ? g - 6u : 0u] + lut_b[b > 6u ? b - 6u : 0u];
 }
 
-/* 64 KB, in BRAM (.bram_bss): read once per pixel, and twice the cache size.
- * The LVGL build still has room for it there (see the linker map). */
-static uint8_t lut565[65536] __attribute__((section(".bram_bss")));
+/* For the gfx module (vx_gfx.c): the same palette, and a colour's index. */
+static bool palette_loaded;
+
+void vx_lvgl_palette_load(void) {
+    if (!palette_loaded) {
+        palette_loaded = true;
+        palette_init();
+        uart_console_lvgl_palette();
+    }
+}
+
+/* The same 256 colours into palette `bank` (0-7, core v0.95). */
+void vx_lvgl_palette_bank(uint32_t bank) {
+    for (uint32_t i = 0u; i < 216u; i++) {
+        uint32_t r = i / 36u, g = (i / 6u) % 6u, b = i % 6u;
+        vih_set_palette8(bank, i, (((r * 31u + 2u) / 5u) << 11) | (((g * 63u + 2u) / 5u) << 5) | ((b * 31u + 2u) / 5u));
+    }
+    for (uint32_t i = 0u; i < GREY_STEPS; i++) {
+        uint32_t v = ((i + 1u) * 255u) / (GREY_STEPS + 1u);
+        vih_set_palette8(bank, GREY_BASE + i, ((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3));
+    }
+}
+
+uint32_t vx_lvgl_rgb_index(uint32_t r, uint32_t g, uint32_t b) {
+    return to_index(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3), 8u);
+}
+
+/* RGB565 -> palette index, 64 KB, read once per pixel: in Trapdoor RAM
+ * (core v0.87+, on-chip, 2 clocks a read, uncached), taken from the kernel's
+ * allocator once per power-up. It used to sit in BRAM, where those 64 KB now
+ * hold code. Without Trapdoor RAM (older core or kernel): chip RAM, read
+ * through the data cache -- it works, a little slower, as the table is
+ * twice the cache size. */
+static uint8_t lut565_chip[65536];
+static uint8_t *lut565;
 
 static void lut565_init(void) {
+    if (lut565 == NULL) {
+        if (KERNEL_ENTRY(KENT_SYS_ALLOC_MEM) != NULL && vih_trapdoor_present()) {
+            lut565 = ksys_alloc_mem(KMEM_TRAPDOOR, 0u, 65536u, 4u);
+        }
+        if (lut565 == NULL) {
+            lut565 = lut565_chip;
+        }
+    }
     for (uint32_t c = 0u; c < 65536u; c++) {
         lut565[c] = (uint8_t)to_index(c, 8u);
         if ((c & 0x3FFu) == 0u) {
@@ -218,7 +267,7 @@ static void blit_rect(uint32_t src_fb, uint32_t dst_fb, int32_t x1, int32_t y1, 
 
 static void sync_dirty(const dirty_t *d, uint32_t src, uint32_t dst) {
     if (d->all) {
-        blit_rect(src, dst, 0, 0, VX_DISP_W - 1, VX_DISP_H - 1);
+        blit_rect(src, dst, 0, 0, disp_w - 1, disp_h - 1);
         return;
     }
     for (uint32_t i = 0u; i < d->n; i++) {
@@ -230,8 +279,8 @@ static void prepare_target(void) {
     target = (front + 1u) % 3u;
     while (ticks_raster_lines() < dirty_hist[1].latch_lines) {
     }
-    sync_dirty(&dirty_hist[1], fb_addr[front], fb_addr[target]);
-    sync_dirty(&dirty_hist[0], fb_addr[front], fb_addr[target]);
+    sync_dirty(&dirty_hist[1], fb_addr[front] + disp_org, fb_addr[target] + disp_org);
+    sync_dirty(&dirty_hist[0], fb_addr[front] + disp_org, fb_addr[target] + disp_org);
     vih_blit_wait();
     target_ready = true;
 }
@@ -244,7 +293,7 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
         prepare_target();
     }
     for (int32_t y = area->y1; y <= area->y2; y++) {
-        convert_row(fb_addr[target], area->x1, y, (const uint16_t *)px_map, w);
+        convert_row(fb_addr[target] + disp_org, area->x1, y, (const uint16_t *)px_map, w);
         px_map += stride;
         ticks_poll();
     }
@@ -287,7 +336,7 @@ void vx_lvgl_set_dither(bool on) {
 
 /* ---- mouse + hardware cursor -------------------------------------------- */
 
-static int32_t mouse_x = VX_DISP_W / 2, mouse_y = VX_DISP_H / 2;
+static int32_t mouse_x = VX_DISP_W / 2, mouse_y = VX_DISP_H / 2;   /* set again at init */
 static uint32_t mouse_last;
 
 static const char *const cursor_art[] = {
@@ -313,7 +362,7 @@ static void cursor_init(void) {
         }
     }
     vih_sprite_attr(CURSOR_CHANNEL, CURSOR_SLOT, 0u, VIH_SPR_8BPP | VIH_SPR_ON_TOP);
-    vih_sprite_pos(CURSOR_CHANNEL, mouse_x, mouse_y);
+    vih_sprite_pos(CURSOR_CHANNEL, mouse_x + (int32_t)disp_left, mouse_y + (int32_t)disp_top);
     vih_sprite_enable_mask(1u << CURSOR_CHANNEL);
     mouse_last = VIH_MOUSE;
 }
@@ -326,10 +375,10 @@ static void mouse_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 
     (void)indev;
     mouse_last = m.raw;
-    mouse_x = LV_CLAMP(0, mouse_x + dx, VX_DISP_W - 1);
-    mouse_y = LV_CLAMP(0, mouse_y + dy, VX_DISP_H - 1);
+    mouse_x = LV_CLAMP(0, mouse_x + dx, disp_w - 1);
+    mouse_y = LV_CLAMP(0, mouse_y + dy, disp_h - 1);
     if (dx != 0 || dy != 0) {
-        vih_sprite_pos(CURSOR_CHANNEL, mouse_x, mouse_y);
+        vih_sprite_pos(CURSOR_CHANNEL, mouse_x + (int32_t)disp_left, mouse_y + (int32_t)disp_top);
     }
     data->point.x = mouse_x;
     data->point.y = mouse_y;
@@ -337,20 +386,6 @@ static void mouse_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
 }
 
 /* ---- set-up ------------------------------------------------------------- */
-
-static void set_xscroll(uint32_t x) {
-    vih_border_dims_t bd = { .raw = 0 };
-    uint64_t until;
-
-    bd.f.top = 8u;                          /* fine scroll latches on border lines */
-    VIH_BORDER_DIMS = bd.raw;
-    vih_gfx_scroll(x & 7u, 0u);
-    until = ticks_raster_lines() + 2u * 312u + 8u;
-    while (ticks_raster_lines() < until) {
-    }
-    bd.f.top = 0u;
-    VIH_BORDER_DIMS = bd.raw;
-}
 
 static uint32_t tick_cb(void) {
     return (uint32_t)ticks_ms();
@@ -360,9 +395,22 @@ void vx_lvgl_display_init(bool dither) {
     lv_display_t *disp;
     lv_indev_t *mouse;
 
-    /* hardware: palette, three cleared framebuffers, fine scroll, cursor */
+    {
+        uint32_t m[4];
+        uart_console_margins(m);
+        disp_left = m[0];
+        disp_top = m[2];
+    }
+    disp_w = (int32_t)uart_console_width();
+    disp_h = (int32_t)uart_console_height();
+    disp_org = disp_top * FB_STRIDE;
+    mouse_x = disp_w / 2;
+    mouse_y = disp_h / 2;
+
+    /* hardware: palette, three cleared framebuffers, scroll, cursor */
     VIH_GFX_ENABLE = 0u;
     palette_init();
+    palette_loaded = true;
     uart_console_lvgl_palette();       /* the console's colours, in the new palette */
     for (uint32_t i = 0u; i < 3u; i++) {
         for (uint32_t half = 0u; half < 2u; half++) {
@@ -372,7 +420,11 @@ void vx_lvgl_display_init(bool dither) {
     }
     vih_blit_wait();
     vih_gfx_ptr_addr(FB_ADDR0);
-    set_xscroll(VX_GFX_XSCROLL);
+    /* Framebuffer column 0 to screen x = the left margin: the 512-pixel line
+     * is circular, so x scroll 512 - left shows columns 512 - left..511
+     * (blank, under the border) first. The top margin is a row offset
+     * instead (disp_org): LVGL draws from framebuffer row `top`. */
+    vih_gfx_scroll((512u - disp_left) & 0x1FFu, 0u);
     front = 0u;
     target_ready = false;
     shown = false;
@@ -386,7 +438,7 @@ void vx_lvgl_display_init(bool dither) {
 
     /* LVGL: lv.init() has run in Python */
     lv_tick_set_cb(tick_cb);
-    disp = lv_display_create(VX_DISP_W, VX_DISP_H);
+    disp = lv_display_create(disp_w, disp_h);
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
     lv_display_set_flush_cb(disp, flush_cb);
     lv_display_set_buffers(disp, draw_buf, NULL, sizeof(draw_buf), LV_DISPLAY_RENDER_MODE_PARTIAL);

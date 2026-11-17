@@ -12,8 +12,8 @@
 #   make CROSS_COMPILE=/path/bin/riscv-none-elf-   -> use an explicit toolchain
 #
 # The .elf is wrapped into a loadable .rvk (single BRAM code block) with the
-# VIXEN devkit's mkrvpk; load it from VIXEN-32's F12/Help "Load RVK" menu.
-# VIXEN-32 itself is untouched (no BOOT.BIN, no trampoline). See docs/building.md.
+# VIXEN devkit's mkrvpk; start it from VIXEN-32's HELP file browser.
+# VIXEN-32 itself is untouched (no KERNEL.BIN change, no trampoline). See docs/building.md.
 
 BOARD ?= VIXEN32
 BOARD_DIR ?= boards/$(BOARD)
@@ -49,13 +49,13 @@ LVGL ?= 0
 ifeq ($(LVGL),1)
 USER_C_MODULES ?= $(abspath ../../deps/usermods)
 LV_CONF_PATH ?= $(abspath lv_conf.h)
-# Code split BRAM / chip RAM (see the linker script), more gc heap for LVGL
-# objects and decoded images. The C stack is in BRAM (vixen_lvgl.ld): 16 KB,
+# Code split BRAM / chip RAM (see the linker script). The gc heap (6 MB, see
+# boards/VIXEN32/mpconfigboard.mk) also holds LVGL's objects and decoded
+# images. The C stack is in BRAM (vixen_lvgl.ld): 16 KB,
 # LVGL's deepest path measured ~5.7 KB.
 LDSCRIPT = mcu/rv32/vixen_lvgl.ld
-MICROPY_HEAP_SIZE = 4194304
 MICROPY_STACK_SIZE = 16384
-SRC_C += vx_lvgl.c vx_lvgl_mp.c
+SRC_C += vx_lvgl.c vx_lvgl_mp.c vx_gfx.c
 CFLAGS += -DVIXEN_LVGL=1
 # Decoded-image cache (lv_conf.h LV_CACHE_DEF_SIZE): without it LVGL decodes a
 # PNG again on every redraw.
@@ -113,6 +113,36 @@ CFLAGS += -DVIXEN_SOUND=1
 $(BUILD)/vixen_sound.o: CFLAGS += -msmall-data-limit=0 -O2
 endif
 
+# SQLite (docs/sqlite.md): `import sqlite3`, the DB-API core on the SQLite
+# amalgamation, from deps/micropython-sqlite3 (setup.sh) as a user C module.
+# vixen_sqlite.c is its OS layer: memory on the gc heap, databases held in RAM
+# and written back whole on every commit (the card has no read+write handle).
+# ~600 KB of code: chip RAM only, so on whenever there is a chip-RAM block.
+ifneq ($(SPLIT_IMAGE),)
+SQLITE ?= 1
+else
+SQLITE ?= 0
+endif
+ifeq ($(SQLITE),1)
+SQLITE_MOD ?= $(abspath ../../deps/micropython-sqlite3/usercmodule)
+ifeq ($(wildcard $(SQLITE_MOD)/sqlite3/micropython.mk),)
+$(error sqlite3 module not found in $(SQLITE_MOD): run ./setup.sh (or build with SQLITE=0))
+endif
+USER_C_MODULES += $(SQLITE_MOD)
+SRC_C += vixen_sqlite.c
+CFLAGS += -DVIXEN_SQLITE=1
+$(BUILD)/vixen_sqlite.o: CFLAGS += -msmall-data-limit=0
+$(BUILD)/sqlite3/sqlite3module.o: CFLAGS += -msmall-data-limit=0
+# The amalgamation: our OS layer instead of the unix one; no WAL (needs shared
+# memory), temp tables and journals in RAM, no mmap, a 512 KB page cache per
+# connection. -w: SQLite does not build clean against -Wdouble-promotion etc.
+$(BUILD)/sqlite3/sqlite3.o: CFLAGS += -msmall-data-limit=0 -w \
+	-DSQLITE_OS_OTHER=1 -DSQLITE_OMIT_WAL -DSQLITE_TEMP_STORE=3 \
+	-DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_DEFAULT_CACHE_SIZE=-512 \
+	-DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_SHARED_CACHE \
+	-DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_LOCALTIME -DSQLITE_ZERO_MALLOC
+endif
+
 # Randomness (os.urandom, TLS, lwIP): chip RAM, state out of the BRAM .sbss.
 $(BUILD)/vixen_random.o: CFLAGS += -msmall-data-limit=0
 
@@ -157,6 +187,7 @@ LDFLAGS += -Wl,--defsym,MICROPY_STACK_SIZE=$(MICROPY_STACK_SIZE)
 
 SRC_C += \
 	mcu/rv32/interrupts.c \
+	mcu/rv32/vixfloat.c \
 	mcu/rv32/startup.c \
 	mcu/riscv/ticks.c \
 	syscalls.c \
@@ -236,8 +267,8 @@ $(BUILD)/firmware-chip.bin: $(BUILD)/firmware.elf
 # functional emulator (tools/emu/vxemu.py, docs/testing.md).
 
 # ---------------------------------------------------------------------------
-# Loadable app: firmware.rvk  (a normal VIXEN-32 .rvk, loaded by the F12/Help
-# "Load RVK" menu -- VIXEN-32 itself is left untouched: no BOOT.BIN, no
+# Loadable app: firmware.rvk  (a normal VIXEN-32 .rvk, started from the HELP
+# file browser -- VIXEN-32 itself is left untouched: no KERNEL.BIN change, no
 # trampoline).
 #
 # The image is DOOM-style: code (text/rodata/data) in on-chip BRAM at 0x100,

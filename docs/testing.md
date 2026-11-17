@@ -17,6 +17,8 @@ host-side tests that start the emulator themselves. Logs go to `tests/out/`.
 | `test_core.py` | language features, standard modules, timebase, 512 KB allocations, every port module imports | no |
 | `test_crypto.py` | SHA-256, AES-CTR (NIST SP 800-38A), `os.urandom`, X25519 (RFC 7748), Ed25519 (RFC 8032 + OpenSSL-made vectors), rejection of bad signatures and points | no |
 | `test_lvgl.py` | display driver, widgets, rendering, PNG decoding (passes trivially without LVGL) | no |
+| `test_sound.py` | WAV loader: 8/16-bit PCM, stereo, decimation, IMA ADPCM against a reference decoder, bad headers; QOA against `qoa.h`, loaded and streamed; streaming through a small ring (placement, refill, end, loop); pause/resume of loaded and streamed files | no |
+| `test_sqlite.py` | `sqlite3` on a RAM `/sd`: types incl. 64-bit, errors, commit/rollback, two connections, recovery from an interrupted write, relative paths, `close()` with live cursors, no memory leak | no |
 | `test_net.py` | `net.up()` with DHCP, then a static setup from a config file, TCP | yes |
 | `test_http.py` | DHCP, DNS, HTTP | yes |
 | `test_https_mip.py` | HTTPS with `requests`, `mip.install()` from micropython.org and GitHub | yes |

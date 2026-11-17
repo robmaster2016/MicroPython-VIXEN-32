@@ -52,27 +52,65 @@
 uintptr_t ticks_ms(void);
 
 /* ---- text screen geometry -------------------------------------------------
- * The whole visible tile grid: 48x28 cells of 8x8 = 384x224 px, no border.
+ * The console sits inside four margins (vixen.console_margin(), pixels):
+ * left 9, right 7, top 4, bottom 4 by default -> 46 x 27 cells of 8x8
+ * (368 x 216 px). Columns = (384 - left - right) / 8, rows = (224 - top -
+ * bottom) / 8; what is left over goes to the right / bottom margin. The
+ * margins are the border, in the console's background colour. Text row 0 is
+ * map row con_y0 = ceil(top / 8); the tile scroll (512 - left, 8 * con_y0 -
+ * top) puts its first cell at screen (left, top). x wraps round the 512-pixel
+ * map line (checked on the hardware); y stays positive, so nothing depends on
+ * how the y scroll wraps.
  *
- * History: the first console was 40x25 at cell (0,0) with the default border,
- * which hid the outer cells (the prompt was invisible); then it sat at cell
- * (2,3) inside a border. The top tile row always looked cut by ~4 lines. The
- * cause is the tile scroll: vih_init_registers() sets it to x=1, y=4 pixels,
- * which moves the whole text layer 4 lines up and 1 pixel left. With the
- * scroll at 0,0 (TILE_SCROLL_X/Y) the grid sits flush and needs no border.
- * vixen.tile_scroll(x, y) adjusts it at run time, should the hardware need
- * an offset after all (the GFX layer needs a fine X scroll of 4). */
-#define CON_COLS 48u
-#define CON_ROWS 28u
-#define CON_X0   0u
-#define CON_Y0   0u
+ * Why margins: since core v0.94 HDMI is 720x576 with the 384 pixels across
+ * the whole width (v0.76: 720p with black bars beside a 4:3 picture). On the
+ * HDMI TV this was set up on, the left ~8 pixels and the right ~2 are cut
+ * off. Top and bottom: the core keeps at least one border line there (v0.78),
+ * which hid the first line of a row at y = 0. On a 1084S or a TV set to show
+ * the whole picture, vixen.console_margin(0, 0, 0, 0) gives 48 x 28.
+ *
+ * History: the first console was 40x25 at cell (0,0) with the default border;
+ * then 48x28 borderless. vih_init_registers() sets the tile scroll to x=1,
+ * y=4; the console replaces it. vixen.tile_scroll(x, y) overrides it. */
+#define CON_COLS_MAX 96u            /* hi-res: 2 x 48 */
+#define CON_ROWS_MAX 28u
 
-#ifndef TILE_SCROLL_X
-#define TILE_SCROLL_X 0u
+#ifndef CON_MARGIN_L
+#define CON_MARGIN_L 9u
 #endif
-#ifndef TILE_SCROLL_Y
-#define TILE_SCROLL_Y 0u
+#ifndef CON_MARGIN_R
+#define CON_MARGIN_R 7u
 #endif
+#ifndef CON_MARGIN_T
+#define CON_MARGIN_T 4u
+#endif
+#ifndef CON_MARGIN_B
+#define CON_MARGIN_B 4u
+#endif
+#define CON_MARGIN_MAX 64u
+
+static uint8_t con_left = CON_MARGIN_L;
+static uint8_t con_top = CON_MARGIN_T;
+static uint8_t con_y0 = (uint8_t)((CON_MARGIN_T + 7u) / 8u);   /* map row of text row 0 */
+/* the 8-pixel grid inside the margins: what LVGL and the border use */
+static uint8_t con_cols8 = (uint8_t)((384u - CON_MARGIN_L - CON_MARGIN_R) / 8u);
+static uint8_t con_cols = (uint8_t)((384u - CON_MARGIN_L - CON_MARGIN_R) / 8u);
+static uint8_t con_rows = (uint8_t)((224u - CON_MARGIN_T - CON_MARGIN_B) / 8u);
+
+/* Hi-res text (core v0.95+, vixen.console_hires()): the tile layer draws 768
+ * dots a line (a dot = half a pixel) from a map 128 cells wide, so the same
+ * area holds twice the columns: 92 x 27 with the default margins. The tile x
+ * scroll counts dots. Map dot m lands on screen dot m - scroll - CON_HIRES_DX:
+ * the hi-res layer sits 24 dots (3 cells) further left than the devkit
+ * describes (measured on core v0.98 on the MEGA65: with no correction text
+ * column 3 was the first one at the left margin). Column 0 is map column
+ * con_x0 = ceil((2 * left + CON_HIRES_DX) / 8), pulled to dot 2 * left by a
+ * small positive scroll -- nothing relies on how the 1024-dot line wraps. Lo-res keeps the scroll of 512 - left over map
+ * column 0 (its 512-pixel wrap is checked on the hardware). */
+#define CON_HIRES_DX 24u
+static bool con_hires;
+static uint8_t con_x0;
+static uint32_t con_mapw = 64u;   /* map cells a row: 64, hi-res 128 */
 
 /* C64-style colours (tut1): light-blue text on a blue background. These are
  * palette INDICES. The LVGL build replaces the whole palette with its colour
@@ -86,7 +124,7 @@ static uint8_t con_curc = 15u;
 #define CON_CUR  con_curc
 
 /* ---- software screen ------------------------------------------------------ */
-static uint32_t con_cells[CON_ROWS][CON_COLS];
+static uint32_t con_cells[CON_ROWS_MAX][CON_COLS_MAX];
 static uint8_t con_cx;
 static uint8_t con_cy;
 static uint8_t con_cur_on;        /* cursor blink phase: 1 = visible */
@@ -107,9 +145,9 @@ static void con_redraw(void) {
     volatile uint32_t *map = VIH_TILE_MAP0_BASE;
     uint8_t r, c;
 
-    for (r = 0; r < CON_ROWS; r++) {
-        for (c = 0; c < CON_COLS; c++) {
-            map[(uint32_t)(r + CON_Y0) * 64u + c + CON_X0] = con_cells[r][c];
+    for (r = 0; r < con_rows; r++) {
+        for (c = 0; c < con_cols; c++) {
+            map[(uint32_t)(r + con_y0) * con_mapw + c + con_x0] = con_cells[r][c];
         }
     }
     /* cursor: draw the cell under it in reverse video (C64 block cursor);
@@ -118,7 +156,7 @@ static void con_redraw(void) {
     {
         vih_tile_cell_t cur;
         cur.raw = con_cells[con_cy][con_cx];
-        map[(uint32_t)(con_cy + CON_Y0) * 64u + con_cx + CON_X0] = con_cur_on
+        map[(uint32_t)(con_cy + con_y0) * con_mapw + con_cx + con_x0] = con_cur_on
             ? con_cell(cur.f.ch, CON_BG, CON_CUR)
             : cur.raw;
     }
@@ -128,19 +166,19 @@ static void con_redraw(void) {
  * immediately after column 39, so readline's "back N" must wrap back up across
  * rows the same way, or editing a line longer than one row breaks. */
 static void con_cursor_back(uint16_t n) {
-    uint16_t pos = (uint16_t)(con_cy * CON_COLS + con_cx);
+    uint16_t pos = (uint16_t)(con_cy * con_cols + con_cx);
     pos = (n > pos) ? 0u : (uint16_t)(pos - n);
-    con_cy = (uint8_t)(pos / CON_COLS);
-    con_cx = (uint8_t)(pos % CON_COLS);
+    con_cy = (uint8_t)(pos / con_cols);
+    con_cx = (uint8_t)(pos % con_cols);
 }
 
 static void con_cursor_fwd(uint16_t n) {
-    uint16_t pos = (uint16_t)(con_cy * CON_COLS + con_cx + n);
-    if (pos >= CON_ROWS * CON_COLS) {
-        pos = CON_ROWS * CON_COLS - 1u;
+    uint16_t pos = (uint16_t)(con_cy * con_cols + con_cx + n);
+    if (pos >= con_rows * con_cols) {
+        pos = con_rows * con_cols - 1u;
     }
-    con_cy = (uint8_t)(pos / CON_COLS);
-    con_cx = (uint8_t)(pos % CON_COLS);
+    con_cy = (uint8_t)(pos / con_cols);
+    con_cx = (uint8_t)(pos % con_cols);
 }
 
 /* Erase from the cursor to the end of the SCREEN. readline sends ESC [ K
@@ -148,9 +186,9 @@ static void con_cursor_fwd(uint16_t n) {
  * rows here, clearing only the current row would leave stale characters on
  * the next one. Nothing below the REPL's input line is worth keeping. */
 static void con_erase_from_cursor(void) {
-    for (uint16_t pos = (uint16_t)(con_cy * CON_COLS + con_cx);
-         pos < CON_ROWS * CON_COLS; pos++) {
-        con_cells[pos / CON_COLS][pos % CON_COLS] = con_cell(' ', CON_FG, CON_BG);
+    for (uint16_t pos = (uint16_t)(con_cy * con_cols + con_cx);
+         pos < con_rows * con_cols; pos++) {
+        con_cells[pos / con_cols][pos % con_cols] = con_cell(' ', CON_FG, CON_BG);
     }
 }
 
@@ -170,7 +208,7 @@ static void con_csi(char final) {
         case 'C': con_cursor_fwd(n); break;
         case 'A': con_cy = (n > con_cy) ? 0u : (uint8_t)(con_cy - n); break;
         case 'B':
-            con_cy = (uint8_t)(((uint16_t)con_cy + n >= CON_ROWS) ? CON_ROWS - 1u : con_cy + n);
+            con_cy = (uint8_t)(((uint16_t)con_cy + n >= con_rows) ? con_rows - 1u : con_cy + n);
             break;
         case 'K': con_erase_from_cursor(); break;
         case 'J':
@@ -188,15 +226,15 @@ static void con_csi(char final) {
 static void con_scroll(void) {
     /* shift every row up, clear the bottom row. */
     memmove(&con_cells[0], &con_cells[1], sizeof(con_cells) - sizeof(con_cells[0]));
-    for (uint8_t c = 0; c < CON_COLS; c++) {
-        con_cells[CON_ROWS - 1u][c] = con_cell(' ', CON_FG, CON_BG);
+    for (uint8_t c = 0; c < con_cols; c++) {
+        con_cells[con_rows - 1u][c] = con_cell(' ', CON_FG, CON_BG);
     }
-    con_cy = CON_ROWS - 1u;
+    con_cy = con_rows - 1u;
 }
 
 static void con_clear(void) {
-    for (uint8_t r = 0; r < CON_ROWS; r++) {
-        for (uint8_t c = 0; c < CON_COLS; c++) {
+    for (uint8_t r = 0; r < con_rows; r++) {
+        for (uint8_t c = 0; c < con_cols; c++) {
             con_cells[r][c] = con_cell(' ', CON_FG, CON_BG);
         }
     }
@@ -243,7 +281,7 @@ static void con_putc(char ch) {
     if (ch == '\n') {
         con_cx = 0u;
         con_cy++;
-        if (con_cy >= CON_ROWS) {
+        if (con_cy >= con_rows) {
             con_scroll();
         }
         con_redraw();
@@ -259,8 +297,8 @@ static void con_putc(char ch) {
     }
     if (ch == '\t') {
         con_cx = (uint8_t)(((uint16_t)con_cx + 8u) & ~7u);
-        if (con_cx >= CON_COLS) {
-            con_cx = CON_COLS - 1u;
+        if (con_cx >= con_cols) {
+            con_cx = con_cols - 1u;
         }
         con_redraw();
         return;
@@ -271,10 +309,10 @@ static void con_putc(char ch) {
 
     con_cells[con_cy][con_cx] = con_cell((uint8_t)ch, CON_FG, CON_BG);
     con_cx++;
-    if (con_cx >= CON_COLS) {
+    if (con_cx >= con_cols) {
         con_cx = 0u;
         con_cy++;
-        if (con_cy >= CON_ROWS) {
+        if (con_cy >= con_rows) {
             con_scroll();
         }
     }
@@ -326,8 +364,8 @@ void uart_console_lvgl_palette(void) {
     con_fg = 88u;
     con_bg = 44u;
     con_curc = 215u;
-    for (uint32_t r = 0u; r < CON_ROWS; r++) {
-        for (uint32_t c = 0u; c < CON_COLS; c++) {
+    for (uint32_t r = 0u; r < con_rows; r++) {
+        for (uint32_t c = 0u; c < con_cols; c++) {
             vih_tile_cell_t cell;
             cell.raw = con_cells[r][c];
             con_cells[r][c] = con_cell(cell.f.ch, CON_FG, CON_BG);
@@ -570,8 +608,15 @@ static char kbd_event(uint8_t code, uint8_t make) {
             case 58:                      /* ctrl */
                 if (make) { kbd_ctrl++; } else if (kbd_ctrl > 0u) { kbd_ctrl--; }
                 return 0u;
-            case 72:                      /* caps lock: toggle on make */
-                if (make) { kbd_caps ^= 1u; }
+            case 72:
+                /* CAPS LOCK latches: make when it locks, break when it is
+                 * released (key 78 is the press itself). Like the C128's
+                 * 40/80 key it switches the console between hi-res (92
+                 * columns, the default) and lo-res (46): every press, locking
+                 * or releasing. Not its position -- the keyboard only reports
+                 * changes, and the one from before the program started went
+                 * to the kernel. So no caps lock here; SHIFT still works. */
+                uart_console_set_hires(!con_hires);
                 return 0u;
             case 61: case 66:             /* MEGA (C=) / ALT: symbol modifier */
                 if (make) { kbd_mega++; } else if (kbd_mega > 0u) { kbd_mega--; }
@@ -746,6 +791,112 @@ void uart_set_tile_scroll(uint32_t x, uint32_t y) {
     VIH_TILE_SCROLL = ts.raw;
 }
 
+/* Border and tile scroll for the current margins (see the geometry notes). A
+ * top or bottom of 0 is stored as 1 by the core (v0.78+). */
+static void con_apply_margin(void) {
+    vih_border_dims_t bd;
+    bd.raw = 0u;
+    bd.f.left = con_left;
+    bd.f.right = (uint8_t)(384u - con_left - 8u * con_cols8);
+    bd.f.top = con_top;
+    bd.f.bottom = (uint8_t)(224u - con_top - 8u * con_rows);
+    VIH_BORDER_DIMS = bd.raw;
+    if (con_hires) {
+        con_x0 = (uint8_t)((2u * con_left + CON_HIRES_DX + 7u) / 8u);
+        uart_set_tile_scroll(8u * con_x0 - 2u * con_left - CON_HIRES_DX, 8u * con_y0 - con_top);
+    } else {
+        con_x0 = 0u;
+        uart_set_tile_scroll((512u - con_left) & 0x1FFu, 8u * con_y0 - con_top);
+    }
+}
+
+/* New geometry (margins or mode): recompute, apply, clear the screen and the
+ * whole map (cells outside the text area show at the edges otherwise). */
+static void con_relayout(void) {
+    con_cols = (uint8_t)(con_hires ? 2u * con_cols8 : con_cols8);
+    con_mapw = con_hires ? VIH_HIRES_MAP_W : 64u;
+    vih_video_mode(con_hires ? 1u : 0u);
+    con_apply_margin();
+    con_clear();
+    for (uint16_t i = 0u; i < VIH_TILE_MAP_CELLS; i++) {
+        VIH_TILE_MAP0_BASE[i] = con_cell(' ', CON_FG, CON_BG);
+    }
+    con_redraw();
+}
+
+/* vixen.console_hires(on) and ESC X: 2 x the columns in the same area (core
+ * v0.95+; older cores ignore the mode and would show the left half). The
+ * text stays: rows as they are, lo-res keeps the left half of each line. */
+void uart_console_set_hires(bool on) {
+    if (on == con_hires) {
+        return;
+    }
+    con_hires = on;
+    con_cols = (uint8_t)(con_hires ? 2u * con_cols8 : con_cols8);
+    con_mapw = con_hires ? VIH_HIRES_MAP_W : 64u;
+    /* past the lo-res width: blank (new in hi-res, dropped in lo-res) */
+    for (uint8_t r = 0; r < con_rows; r++) {
+        for (uint8_t c = con_cols8; c < CON_COLS_MAX; c++) {
+            con_cells[r][c] = con_cell(' ', CON_FG, CON_BG);
+        }
+    }
+    if (con_cx >= con_cols) {
+        con_cx = (uint8_t)(con_cols - 1u);
+    }
+    vih_video_mode(con_hires ? 1u : 0u);
+    con_apply_margin();
+    for (uint16_t i = 0u; i < VIH_TILE_MAP_CELLS; i++) {
+        VIH_TILE_MAP0_BASE[i] = con_cell(' ', CON_FG, CON_BG);
+    }
+    con_redraw();
+}
+
+bool uart_console_hires(void) {
+    return con_hires;
+}
+
+uint32_t uart_console_cols(void) {
+    return con_cols;
+}
+
+uint32_t uart_console_rows(void) {
+    return con_rows;
+}
+
+/* vixen.console_margin(left, right, top, bottom): new margins in pixels,
+ * each 0..CON_MARGIN_MAX. Columns and rows change with them, so the screen is
+ * cleared. */
+bool uart_console_set_margin(uint32_t l, uint32_t r, uint32_t t, uint32_t b) {
+    if (l > CON_MARGIN_MAX || r > CON_MARGIN_MAX || t > CON_MARGIN_MAX || b > CON_MARGIN_MAX) {
+        return false;
+    }
+    con_left = (uint8_t)l;
+    con_top = (uint8_t)t;
+    con_y0 = (uint8_t)((t + 7u) / 8u);
+    con_cols8 = (uint8_t)((384u - l - r) / 8u);
+    con_rows = (uint8_t)((224u - t - b) / 8u);
+    con_relayout();
+    return true;
+}
+
+/* The margins as they are: left, right, top, bottom (right/bottom include
+ * what the 8-pixel grid leaves over). */
+void uart_console_margins(uint32_t m[4]) {
+    m[0] = con_left;
+    m[1] = 384u - con_left - 8u * con_cols8;
+    m[2] = con_top;
+    m[3] = 224u - con_top - 8u * con_rows;
+}
+
+/* The picture area inside the margins, in pixels (LVGL uses the same). */
+uint32_t uart_console_width(void) {
+    return 8u * con_cols8;
+}
+
+uint32_t uart_console_height(void) {
+    return 8u * con_rows;
+}
+
 void uart_init(void) {
     vih_init_registers();
 
@@ -760,9 +911,7 @@ void uart_init(void) {
     VIH_TILES_ENABLE = 1u;
     VIH_GFX_ENABLE = 0u;
     VIH_BORDER_COLOR = CON_BG;
-    VIH_BORDER_DIMS = 0u;          /* no border: the console fills the screen */
     VIH_BG_COLOR = CON_BG;
-    uart_set_tile_scroll(TILE_SCROLL_X, TILE_SCROLL_Y);
 
     kbd_shift = 0u;
     kbd_ctrl = 0u;
@@ -771,12 +920,10 @@ void uart_init(void) {
     kbd_buf_rd = kbd_buf_wr = 0u;
     con_cur_on = 1u;
     con_blink_ms = (uint32_t)ticks_ms() + 300u;
-    con_clear();
 
-    /* Wipe the WHOLE 64x64 tile map, not just the visible 48x28 window: with a
-     * tile scroll other than 0,0 cells beyond it come into view. */
-    for (uint16_t i = 0u; i < VIH_TILE_MAP_CELLS; i++) {
-        VIH_TILE_MAP0_BASE[i] = con_cell(' ', CON_FG, CON_BG);
-    }
-    con_redraw();
+    /* Hi-res text, 92 columns; CAPS LOCK switches (see kbd_event).
+     * con_relayout() clears the text and the WHOLE tile map: with a tile
+     * scroll other than 0,0 cells beyond the text come into view. */
+    con_hires = true;
+    con_relayout();
 }

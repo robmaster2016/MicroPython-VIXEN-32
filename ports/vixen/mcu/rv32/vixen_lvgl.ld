@@ -8,11 +8,11 @@
  * slower for code that fits the 32 KB cache and ~5.4x slower beyond it. So:
  *
  *   BRAM   the hot paths: LVGL's software renderer, refresh, style/area/colour
- *          helpers, font glyph lookup, the MicroPython VM and object core, the
- *          port itself, libc/libgcc; all small (gp-relative) data; the LVGL
- *          render buffer (.bram_bss).
+ *          helpers, font glyph lookup, the MicroPython VM, object core and
+ *          compiler, the port itself, libc/libgcc; all small (gp-relative)
+ *          data; the LVGL render buffer (.bram_bss).
  *   chip   everything else, code and constants: the generated binding
- *          (lv_mpy.c), the compiler/parser, widgets, themes, layouts, font
+ *          (lv_mpy.c), widgets, themes, layouts, font
  *          bitmaps, lodepng, extmod, libm. Runs/reads through the cache.
  *
  * Chip-RAM layout (byte offsets in the 16 MB window at 0x40000000):
@@ -49,10 +49,10 @@ SECTIONS
         *(.text.start)
         *(.start)
 
-        /* the port */
+        /* the port (not main.c: it runs once, its gc_collect() once per
+         * collection -- from chip RAM) */
         *mcu/rv32/*.o(.text* .rodata*)
         *mcu/riscv/*.o(.text* .rodata*)
-        */main.o(.text* .rodata*)
         */uart.o(.text* .rodata*)
         */mphalport.o(.text* .rodata*)
         */syscalls.o(.text* .rodata*)
@@ -61,6 +61,10 @@ SECTIONS
         /* curve25519: field multiply and square, most of every X25519/Ed25519
          * operation (its stack is in .bram_bss, see vixen_25519.c) */
         */vixen_25519.o(.text.fe_mul .text.fe_sq)
+        /* the IMA ADPCM and QOA decoder loops: from chip RAM they run at half
+         * speed (vixen_sound.c, SPEED) */
+        */vixen_sound.o(.text.ima_run .rodata.ima_step .rodata.ima_index)
+        */vixen_sound.o(.text.qoa_run .rodata.qoa_dequant)
         /* AES encryption (CTR for sshd, GCM for TLS) and SHA-256: the bulk
          * data path of every encrypted transfer (~11 KB). They run on the
          * same BRAM stack (__wrap_ functions in vixen_25519.c). */
@@ -94,7 +98,9 @@ SECTIONS
         *py/objslice.o(.text* .rodata*)
         *py/objfloat.o(.text*)
         *py/map.o(.text* .rodata*)
-        *py/gc.o(.text* .rodata*)
+        /* gc: not the cold calls (gc_init, gc_add for a Zorro area, gc_info,
+         * gc_dump_*): those run from chip RAM */
+        *py/gc.o(.text .text.gc_[!adi]* .text.gc_alloc .text.gc_info_fast .text.gc_is_locked .rodata)
         *py/qstr.o(.text*)
         *py/mpstate.o(.text* .rodata*)
         *py/nlr*.o(.text* .rodata*)
@@ -105,6 +111,16 @@ SECTIONS
         *py/malloc.o(.text* .rodata*)
         *py/vstr.o(.text* .rodata*)
         *py/mpprint.o(.text*)
+
+        /* the compiler: every import of a .py and every REPL line runs it
+         * (room since LVGL's colour table moved to Trapdoor RAM, vx_lvgl.c) */
+        *py/lexer.o(.text* .rodata*)
+        *py/parse.o(.text* .rodata*)
+        *py/parsenum*.o(.text* .rodata*)
+        *py/scope.o(.text* .rodata*)
+        *py/compile.o(.text* .rodata*)
+        *py/emitbc.o(.text* .rodata*)
+        *py/emitcommon.o(.text* .rodata*)
 
         /* LVGL: rendering and everything a refresh touches */
         *lvgl/src/draw/sw/*(.text* .rodata*)

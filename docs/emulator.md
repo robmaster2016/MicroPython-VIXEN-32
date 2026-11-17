@@ -6,6 +6,8 @@ the port on a PC:
 
 * BRAM and the 16 MB chip-RAM window
 * the raster counter as the timebase (follows the wall clock)
+* the float co-processor (`VIH_FPU_*`): binary32, denormals flushed to zero,
+  as the hardware
 * the Ethernet MAC: registers and packet windows, 32-bit access enforced. The
   frames are bridged over UDP to a QEMU user-mode network (DHCP gives
   10.0.2.15, DNS 10.0.2.3, NAT to the internet).
@@ -48,6 +50,8 @@ frame counts, the C stack high-water mark and the curve25519 BRAM stack use.
 | `VX_SHOT_END=file.png` | with `VX_SCREEN`: a screenshot when the script is done |
 | `VX_TYPE=1` | type the script into the normal REPL line by line, as a user would (echo and prompts appear on the screen) |
 | `VX_SETUP=file` | with `VX_TYPE`: run this script through the raw REPL first, e.g. to fill the RAM `/sd` |
+| `VX_ZORRO=1` | model Zorro RAM (48 MB at `0x41000000`) and the kernel's allocator for it, so the gc heap can grow beyond chip RAM; the emulator prints each area it hands out or takes back |
+| `VX_RVC=1` | stop at the first compressed (16-bit) instruction: the VIXEN core has no C extension, Unicorn runs them. Slow (hooks every instruction); `tests/test_native.py` uses it |
 | `VX_SOUNDLOG=file` | log SID and PCM register writes as `time_s reg value`, dump the sound module's chip-RAM window to `file.bin` |
 
 Example: the SSH server with a RAM SD card, reachable from the host:

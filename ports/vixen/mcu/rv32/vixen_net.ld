@@ -66,12 +66,19 @@ SECTIONS
         /* curve25519: field multiply and square, most of every X25519/Ed25519
          * operation (its stack is in .bram_bss, see vixen_25519.c) */
         */vixen_25519.o(.text.fe_mul)
+        /* the IMA ADPCM and QOA decoder loops: from chip RAM they run at half
+         * speed (vixen_sound.c, SPEED) */
+        */vixen_sound.o(.text.ima_run .rodata.ima_step .rodata.ima_index)
+        */vixen_sound.o(.text.qoa_run .rodata.qoa_dequant)
 
         /* everything else except the rest of the network code: libraries,
-         * TLS/NIC bindings, the frozen modules and the sound module */
-        *(EXCLUDE_FILE(*lib/lwip/* *lib/mbedtls/* *lib/mbedtls_errors/* *frozen_content.o *extmod/modtls_mbedtls.o *extmod/mbedtls/* *extmod/network_lwip.o *extmod/modnetwork.o *extmod/modwebsocket.o *extmod/modwebrepl.o */vixen_sound.o */vixen_random.o */vixen_25519.o *extmod/os_dupterm.o *extmod/modcryptolib.o) .text*)
-        *(EXCLUDE_FILE(*lib/lwip/* *lib/mbedtls/* *lib/mbedtls_errors/* *frozen_content.o *extmod/modtls_mbedtls.o *extmod/mbedtls/* *extmod/network_lwip.o *extmod/modnetwork.o *extmod/modwebsocket.o *extmod/modwebrepl.o */vixen_sound.o */vixen_random.o */vixen_25519.o *extmod/os_dupterm.o *extmod/modcryptolib.o) .rodata*)
-        *(EXCLUDE_FILE(*lib/lwip/* *lib/mbedtls/* *lib/mbedtls_errors/* *frozen_content.o *extmod/modtls_mbedtls.o *extmod/mbedtls/* *extmod/network_lwip.o *extmod/modnetwork.o *extmod/modwebsocket.o *extmod/modwebrepl.o */vixen_sound.o */vixen_random.o */vixen_25519.o *extmod/os_dupterm.o *extmod/modcryptolib.o) .data*)
+         * TLS/NIC bindings, the frozen modules, the sound module, the card
+         * driver (vixen_disk.o: one kernel call per read, BRAM is full) and
+         * SQLite with the libgcc/libc parts only it pulls in (64-bit integer
+         * and double arithmetic, string helpers) */
+        *(EXCLUDE_FILE(*lib/lwip/* *lib/mbedtls/* *lib/mbedtls_errors/* *frozen_content.o *extmod/modtls_mbedtls.o *extmod/mbedtls/* *extmod/network_lwip.o *extmod/modnetwork.o *extmod/modwebsocket.o *extmod/modwebrepl.o */vixen_sound.o */vixen_random.o */vixen_25519.o */vixen_disk.o */vixen_sqlite.o *sqlite3/sqlite3.o *sqlite3/sqlite3module.o *libgcc.a:_ashrdi3.o *libgcc.a:_clzdi2.o *libgcc.a:_divdi3.o *libgcc.a:_moddi3.o *libgcc.a:_umoddi3.o *libgcc.a:adddf3.o *libgcc.a:fixdfdi.o *libgcc.a:fixdfsi.o *libgcc.a:fixunsdfdi.o *libgcc.a:floatdidf.o *libgcc.a:floatsidf.o *libgcc.a:floatundidf.o *libgcc.a:gedf2.o *libc.a:libc_a-strncasecmp.o *libc.a:libc_a-strrchr.o *extmod/os_dupterm.o *extmod/modcryptolib.o) .text*)
+        *(EXCLUDE_FILE(*lib/lwip/* *lib/mbedtls/* *lib/mbedtls_errors/* *frozen_content.o *extmod/modtls_mbedtls.o *extmod/mbedtls/* *extmod/network_lwip.o *extmod/modnetwork.o *extmod/modwebsocket.o *extmod/modwebrepl.o */vixen_sound.o */vixen_random.o */vixen_25519.o */vixen_disk.o */vixen_sqlite.o *sqlite3/sqlite3.o *sqlite3/sqlite3module.o *libgcc.a:_ashrdi3.o *libgcc.a:_clzdi2.o *libgcc.a:_divdi3.o *libgcc.a:_moddi3.o *libgcc.a:_umoddi3.o *libgcc.a:adddf3.o *libgcc.a:fixdfdi.o *libgcc.a:fixdfsi.o *libgcc.a:fixunsdfdi.o *libgcc.a:floatdidf.o *libgcc.a:floatsidf.o *libgcc.a:floatundidf.o *libgcc.a:gedf2.o *libc.a:libc_a-strncasecmp.o *libc.a:libc_a-strrchr.o *extmod/os_dupterm.o *extmod/modcryptolib.o) .rodata*)
+        *(EXCLUDE_FILE(*lib/lwip/* *lib/mbedtls/* *lib/mbedtls_errors/* *frozen_content.o *extmod/modtls_mbedtls.o *extmod/mbedtls/* *extmod/network_lwip.o *extmod/modnetwork.o *extmod/modwebsocket.o *extmod/modwebrepl.o */vixen_sound.o */vixen_random.o */vixen_25519.o */vixen_disk.o */vixen_sqlite.o *sqlite3/sqlite3.o *sqlite3/sqlite3module.o *libgcc.a:_ashrdi3.o *libgcc.a:_clzdi2.o *libgcc.a:_divdi3.o *libgcc.a:_moddi3.o *libgcc.a:_umoddi3.o *libgcc.a:adddf3.o *libgcc.a:fixdfdi.o *libgcc.a:fixdfsi.o *libgcc.a:fixunsdfdi.o *libgcc.a:floatdidf.o *libgcc.a:floatsidf.o *libgcc.a:floatundidf.o *libgcc.a:gedf2.o *libc.a:libc_a-strncasecmp.o *libc.a:libc_a-strrchr.o *extmod/os_dupterm.o *extmod/modcryptolib.o) .data*)
 
         /* gp-relative small data stays in BRAM near _global_pointer (+/-2 KB). */
         *(.sdata*)

@@ -1,0 +1,299 @@
+diff --git a/py/asmrv32.c b/py/asmrv32.c
+index 53481d1..ac1e5cf 100644
+--- a/py/asmrv32.c
++++ b/py/asmrv32.c
+@@ -423,7 +423,7 @@ void asm_rv32_emit_jump_if_reg_nonzero(asm_rv32_t *state, mp_uint_t rs, mp_uint_
+     //    jalr   zero, temporary, LO(displacement) ; PC + 8
+     //    ...                                      ; PC + 12
+ 
+-    if (can_emit_short_jump && RV32_IS_IN_C_REGISTER_WINDOW(rs)) {
++    if (MICROPY_EMIT_RV32_RVC && can_emit_short_jump && RV32_IS_IN_C_REGISTER_WINDOW(rs)) {
+         asm_rv32_opcode_cbeqz(state, RV32_MAP_IN_C_REGISTER_WINDOW(rs), 10);
+         // Compensate for the C.BEQZ opcode.
+         displacement -= ASM_HALFWORD_SIZE;
+diff --git a/py/asmrv32.h b/py/asmrv32.h
+index f71fe72..8355352 100644
+--- a/py/asmrv32.h
++++ b/py/asmrv32.h
+@@ -139,6 +139,15 @@ void asm_rv32_entry(asm_rv32_t *state, mp_uint_t locals);
+ void asm_rv32_exit(asm_rv32_t *state);
+ void asm_rv32_end_pass(asm_rv32_t *state);
+ 
++// MICROPY_EMIT_RV32_RVC: 1 (default) = compressed (C extension) opcodes where
++// they fit. 0 = never: every asm_rv32_opcode_c*() emits its 32-bit equivalent
++// instead, for cores without the C extension (e.g. VIXEN-32, rv32im).
++#ifndef MICROPY_EMIT_RV32_RVC
++#define MICROPY_EMIT_RV32_RVC (1)
++#endif
++// A register of the compressed 3-bit window (x8..x15) as a full register.
++#define RV32_C_REG(r) ((r) + ASM_RV32_REG_X8)
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ #define RV32_ENCODE_TYPE_B(op, ft3, rs1, rs2, imm) \
+@@ -291,30 +300,50 @@ static inline void asm_rv32_opcode_bne(asm_rv32_t *state, mp_uint_t rs1, mp_uint
+ 
+ // C.ADD RD, RS
+ static inline void asm_rv32_opcode_cadd(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_R(0x33, 0x00, 0x00, rd, rd, rs));
++    return;
++    #endif
+     // CR: 1001 ..... ..... 10
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CR(0x02, 0x09, rd, rs));
+ }
+ 
+ // C.ADDI RD, IMMEDIATE
+ static inline void asm_rv32_opcode_caddi(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x13, 0x00, rd, rd, immediate));
++    return;
++    #endif
+     // CI: 000 . ..... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CI(0x01, 0x00, rd, immediate));
+ }
+ 
+ // C.ADDI4SPN RD', IMMEDIATE
+ static inline void asm_rv32_opcode_caddi4spn(asm_rv32_t *state, mp_uint_t rd, mp_uint_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x13, 0x00, RV32_C_REG(rd), ASM_RV32_REG_SP, immediate));
++    return;
++    #endif
+     // CIW: 000 ........ ... 00
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CIW(0x00, 0x00, rd, immediate));
+ }
+ 
+ // C.AND RD', RS'
+ static inline void asm_rv32_opcode_cand(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_R(0x33, 0x07, 0x00, RV32_C_REG(rd), RV32_C_REG(rd), RV32_C_REG(rs)));
++    return;
++    #endif
+     // CA: 100011 ... 11 ... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CA(0x01, 0x23, 0x03, rd, rs));
+ }
+ 
+ // C.ANDI RD', IMMEDIATE
+ static inline void asm_rv32_opcode_candi(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x13, 0x07, RV32_C_REG(rd), RV32_C_REG(rd), immediate));
++    return;
++    #endif
+     // CB: 100 . 10 ... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CB(0x01, 0x04, rd,
+         (((immediate & 0x20) << 2) | (immediate & 0x1F) | 0x40)));
+@@ -322,6 +351,10 @@ static inline void asm_rv32_opcode_candi(asm_rv32_t *state, mp_uint_t rd, mp_int
+ 
+ // C.BEQZ RS', IMMEDIATE
+ static inline void asm_rv32_opcode_cbeqz(asm_rv32_t *state, mp_uint_t rs, mp_int_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_B(0x63, 0x00, RV32_C_REG(rs), ASM_RV32_REG_ZERO, offset));
++    return;
++    #endif
+     // CB: 110 ... ... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CB(0x01, 0x06, rs,
+         (((offset & 0x100) >> 1) | ((offset & 0xC0) >> 3) | ((offset & 0x20) >> 5) |
+@@ -330,6 +363,10 @@ static inline void asm_rv32_opcode_cbeqz(asm_rv32_t *state, mp_uint_t rs, mp_int
+ 
+ // C.BNEZ RS', IMMEDIATE
+ static inline void asm_rv32_opcode_cbnez(asm_rv32_t *state, mp_uint_t rs, mp_int_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_B(0x63, 0x01, RV32_C_REG(rs), ASM_RV32_REG_ZERO, offset));
++    return;
++    #endif
+     // CB: 111 ... ... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CB(0x01, 0x07, rs,
+         (((offset & 0x100) >> 1) | ((offset & 0xC0) >> 3) | ((offset & 0x20) >> 5) |
+@@ -338,84 +375,140 @@ static inline void asm_rv32_opcode_cbnez(asm_rv32_t *state, mp_uint_t rs, mp_int
+ 
+ // C.EBREAK
+ static inline void asm_rv32_opcode_cebreak(asm_rv32_t *state) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, 0x00100073);
++    return;
++    #endif
+     // CA: 100 1 00000 00000 10
+     asm_rv32_emit_halfword_opcode(state, 0x9002);
+ }
+ 
+ // C.J OFFSET
+ static inline void asm_rv32_opcode_cj(asm_rv32_t *state, mp_int_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_J(0x6F, ASM_RV32_REG_ZERO, offset));
++    return;
++    #endif
+     // CJ: 101 ........... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CJ(0x01, 0x05, offset));
+ }
+ 
+ // C.JAL OFFSET
+ static inline void asm_rv32_opcode_cjal(asm_rv32_t *state, mp_int_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_J(0x6F, ASM_RV32_REG_RA, offset));
++    return;
++    #endif
+     // CJ: 001 ........... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CJ(0x01, 0x01, offset));
+ }
+ 
+ // C.JALR RS
+ static inline void asm_rv32_opcode_cjalr(asm_rv32_t *state, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x67, 0x00, ASM_RV32_REG_RA, rs, 0));
++    return;
++    #endif
+     // CR: 1001 ..... 00000 10
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CR(0x02, 0x09, rs, 0));
+ }
+ 
+ // C.JR RS
+ static inline void asm_rv32_opcode_cjr(asm_rv32_t *state, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x67, 0x00, ASM_RV32_REG_ZERO, rs, 0));
++    return;
++    #endif
+     // CR: 1000 ..... 00000 10
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CR(0x02, 0x08, rs, 0));
+ }
+ 
+ // C.LI RD, IMMEDIATE
+ static inline void asm_rv32_opcode_cli(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x13, 0x00, rd, ASM_RV32_REG_ZERO, immediate));
++    return;
++    #endif
+     // CI: 010 . ..... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CI(0x01, 0x02, rd, immediate));
+ }
+ 
+ // C.LUI RD, IMMEDIATE
+ static inline void asm_rv32_opcode_clui(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_U(0x37, rd, immediate));
++    return;
++    #endif
+     // CI: 011 . ..... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CI(0x01, 0x03, rd, immediate >> 12));
+ }
+ 
+ // C.LW RD', OFFSET(RS')
+ static inline void asm_rv32_opcode_clw(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs, mp_int_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x03, 0x02, RV32_C_REG(rd), RV32_C_REG(rs), offset));
++    return;
++    #endif
+     // CL: 010 ... ... .. ... 00
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CL(0x00, 0x02, rd, rs, offset));
+ }
+ 
+ // C.LWSP RD, OFFSET
+ static inline void asm_rv32_opcode_clwsp(asm_rv32_t *state, mp_uint_t rd, mp_uint_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x03, 0x02, rd, ASM_RV32_REG_SP, offset));
++    return;
++    #endif
+     // CI: 010 . ..... ..... 10
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CI(0x02, 0x02, rd, ((offset & 0xC0) >> 6) | (offset & 0x3C)));
+ }
+ 
+ // C.MV RD, RS
+ static inline void asm_rv32_opcode_cmv(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_R(0x33, 0x00, 0x00, rd, ASM_RV32_REG_ZERO, rs));
++    return;
++    #endif
+     // CR: 1000 ..... ..... 10
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CR(0x02, 0x08, rd, rs));
+ }
+ 
+ // C.NOP
+ static inline void asm_rv32_opcode_cnop(asm_rv32_t *state) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, 0x00000013);
++    return;
++    #endif
+     // CI: 000 . 00000 ..... 01
+     asm_rv32_emit_halfword_opcode(state, 0x0001);
+ }
+ 
+ // C.OR RD', RS'
+ static inline void asm_rv32_opcode_cor(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_R(0x33, 0x06, 0x00, RV32_C_REG(rd), RV32_C_REG(rd), RV32_C_REG(rs)));
++    return;
++    #endif
+     // CA: 100011 ... 10 ... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CA(0x01, 0x23, 0x02, rd, rs));
+ }
+ 
+ // C.SLLI RD, IMMEDIATE
+ static inline void asm_rv32_opcode_cslli(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x13, 0x01, rd, rd, immediate & 0x1F));
++    return;
++    #endif
+     // CI: 000 . ..... ..... 10
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CI(0x02, 0x00, rd, immediate));
+ }
+ 
+ // C.SRAI RD, IMMEDIATE
+ static inline void asm_rv32_opcode_csrai(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x13, 0x05, RV32_C_REG(rd), RV32_C_REG(rd), ((immediate & 0x1F) | 0x400)));
++    return;
++    #endif
+     // CB: 100 . 01 ... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CB(0x01, 0x04, rd,
+         (((immediate & 0x20) << 2) | (immediate & 0x1F) | 0x20)));
+@@ -423,6 +516,10 @@ static inline void asm_rv32_opcode_csrai(asm_rv32_t *state, mp_uint_t rd, mp_int
+ 
+ // C.SRLI RD, IMMEDIATE
+ static inline void asm_rv32_opcode_csrli(asm_rv32_t *state, mp_uint_t rd, mp_int_t immediate) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_I(0x13, 0x05, RV32_C_REG(rd), RV32_C_REG(rd), immediate & 0x1F));
++    return;
++    #endif
+     // CB: 100 . 00 ... ..... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CB(0x01, 0x04, rd,
+         (((immediate & 0x20) << 2) | (immediate & 0x1F))));
+@@ -430,24 +527,40 @@ static inline void asm_rv32_opcode_csrli(asm_rv32_t *state, mp_uint_t rd, mp_int
+ 
+ // C.SUB RD', RS'
+ static inline void asm_rv32_opcode_csub(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_R(0x33, 0x00, 0x20, RV32_C_REG(rd), RV32_C_REG(rd), RV32_C_REG(rs)));
++    return;
++    #endif
+     // CA: 100011 ... 00 ... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CA(0x01, 0x23, 0x00, rd, rs));
+ }
+ 
+ // C.SW RS1', OFFSET(RS2')
+ static inline void asm_rv32_opcode_csw(asm_rv32_t *state, mp_uint_t rs1, mp_uint_t rs2, mp_int_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_S(0x23, 0x02, RV32_C_REG(rs2), RV32_C_REG(rs1), offset));
++    return;
++    #endif
+     // CS: 110 ... ... .. ... 00
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CL(0x00, 0x06, rs1, rs2, offset));
+ }
+ 
+ // C.SWSP RS, OFFSET
+ static inline void asm_rv32_opcode_cswsp(asm_rv32_t *state, mp_uint_t rs, mp_uint_t offset) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_S(0x23, 0x02, ASM_RV32_REG_SP, rs, offset));
++    return;
++    #endif
+     // CSS: 010 ...... ..... 10
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CSS(0x02, 0x06, rs, ((offset & 0xC0) >> 6) | (offset & 0x3C)));
+ }
+ 
+ // C.XOR RD', RS'
+ static inline void asm_rv32_opcode_cxor(asm_rv32_t *state, mp_uint_t rd, mp_uint_t rs) {
++    #if !MICROPY_EMIT_RV32_RVC
++    asm_rv32_emit_word_opcode(state, RV32_ENCODE_TYPE_R(0x33, 0x04, 0x00, RV32_C_REG(rd), RV32_C_REG(rd), RV32_C_REG(rs)));
++    return;
++    #endif
+     // CA: 100011 ... 01 ... 01
+     asm_rv32_emit_halfword_opcode(state, RV32_ENCODE_TYPE_CA(0x01, 0x23, 0x01, rd, rs));
+ }
